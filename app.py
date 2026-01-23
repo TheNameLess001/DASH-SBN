@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 import os
 import unicodedata
 from datetime import timedelta
@@ -69,7 +70,7 @@ def load_data(main_file, pipelines_norm):
     df['year_month'] = df['order_datetime'].dt.to_period('M')
 
     # Numérique
-    for c in ['item total', 'delivery amount']:
+    for c in ['item total', 'delivery amount', 'delivery time(M)', 'Time Taken']:
         if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
     # Attribution AM
@@ -118,10 +119,10 @@ with st.sidebar:
     st.header("📂 Données")
     uploaded_file = st.file_uploader("Fichier CSV", type=['csv'])
     
-    # Auto-load local (Optionnel)
     if not uploaded_file:
+        # Fallback local (Optionnel)
         local = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
-        # if os.path.exists(local): uploaded_file = local 
+        # if os.path.exists(local): uploaded_file = local
         pass
 
     if uploaded_file:
@@ -133,12 +134,11 @@ with st.sidebar:
     st.divider()
     st.header("🎯 Scope & Filtres")
     
-    # 1. SCOPE (GLOBAL OU AM)
+    # 1. SCOPE
     scope_options = ['Global', 'NAJWA', 'HOUDA', 'CHAIMA']
     selected_scope = st.selectbox("Vue (Scope)", scope_options)
     
-    # 2. FILTRE ENSEIGNE
-    # On filtre les options d'enseigne selon le scope choisi pour éviter le bruit
+    # 2. ENSEIGNE
     if selected_scope != 'Global':
         df_scope_preview = df[df['AM'] == selected_scope]
         available_brands = ['Tous'] + sorted(df_scope_preview['Enseigne_Groupe'].unique().tolist())
@@ -148,93 +148,63 @@ with st.sidebar:
     sel_brand = st.selectbox("Enseigne / Groupe", available_brands)
     
     # 3. DATE
-    # On prend tout par défaut pour le tableau mensuel, mais on garde le datepicker pour l'analyse fine
     min_d, max_d = df['date'].min(), df['date'].max()
-    st.caption(f"Données disponibles du {min_d} au {max_d}")
+    st.caption(f"Période dispo : {min_d} au {max_d}")
 
 # ---------------------------------------------------------
-# PRÉPARATION DES DONNÉES FILTRÉES
+# PRÉPARATION
 # ---------------------------------------------------------
-
-# Filtre Scope (AM)
 if selected_scope == 'Global':
     df_scope = df.copy()
-    # Pipeline Global = Union de tous les pipelines
     current_pipeline = []
-    for p_list in pipelines_norm.values():
-        current_pipeline.extend(p_list)
-    current_pipeline = list(set(current_pipeline)) # Unique
+    for p_list in pipelines_norm.values(): current_pipeline.extend(p_list)
+    current_pipeline = list(set(current_pipeline))
 else:
     df_scope = df[df['AM'] == selected_scope]
     current_pipeline = pipelines_norm.get(selected_scope, [])
 
-# Filtre Enseigne
 if sel_brand != 'Tous':
     df_scope = df_scope[df_scope['Enseigne_Groupe'] == sel_brand]
 
 if df_scope.empty:
-    st.warning("Aucune donnée pour ce scope.")
+    st.warning("Aucune donnée.")
     st.stop()
 
 # ---------------------------------------------------------
-# 1. TABLEAU KPI MENSUEL (L'élément central demandé)
+# 1. KPI MENSUEL (MAIN TABLE)
 # ---------------------------------------------------------
 st.subheader(f"📊 Performance Mensuelle : {selected_scope}")
 
-# Agrégation par mois
 monthly_stats = df_scope.groupby('year_month').agg({
     'item total': 'sum',
     'order id': 'count',
     'is_automated': 'sum',
-    'status': lambda x: (x == 'Restaurant Rejected').sum() # Compte les rejets
+    'status': lambda x: x.astype(str).str.contains('Reject|Cancel', case=False).sum()
 }).reset_index().sort_values('year_month')
 
 monthly_stats['Mois'] = monthly_stats['year_month'].dt.strftime('%Y-%m')
-
-# Calculs Metrics
 monthly_stats['AOV'] = monthly_stats['item total'] / monthly_stats['order id']
 monthly_stats['Auto %'] = (monthly_stats['is_automated'] / monthly_stats['order id'] * 100)
-monthly_stats['Accept %'] = ((monthly_stats['order id'] - monthly_stats['status']) / monthly_stats['order id'] * 100) # status contient le nb de rejects ici
-
-# Calcul Growth (MoM)
+monthly_stats['Rejet/Cancel %'] = (monthly_stats['status'] / monthly_stats['order id'] * 100)
 monthly_stats['CA Prev'] = monthly_stats['item total'].shift(1)
 monthly_stats['Growth %'] = ((monthly_stats['item total'] - monthly_stats['CA Prev']) / monthly_stats['CA Prev'] * 100).fillna(0)
 
-# Calcul Inactifs Mensuels
-# Pour chaque mois, on regarde quels restaurants du pipeline N'ONT PAS commandé
+# Inactifs Mensuels
 inactifs_list = []
-total_pipeline_len = len(current_pipeline)
-
 for ym in monthly_stats['year_month']:
-    # Restos actifs ce mois-ci
-    actifs_this_month = df_scope[df_scope['year_month'] == ym]['restaurant_norm'].unique().tolist()
-    
-    # Combien du pipeline sont dedans ?
-    found_count = 0
-    if total_pipeline_len > 0:
+    actifs = df_scope[df_scope['year_month'] == ym]['restaurant_norm'].unique().tolist()
+    matched = 0
+    if len(current_pipeline) > 0:
         for p in current_pipeline:
-            # Match flexible
-            if any(p in a for a in actifs_this_month):
-                found_count += 1
-        
-        nb_inactifs = max(0, total_pipeline_len - found_count)
+            if any(p in a for a in actifs): matched += 1
+        inactifs_list.append(max(0, len(current_pipeline) - matched))
     else:
-        nb_inactifs = 0
-    inactifs_list.append(nb_inactifs)
-
+        inactifs_list.append(0)
 monthly_stats['Inactifs'] = inactifs_list
-monthly_stats['Pipeline'] = total_pipeline_len
 
-# Mise en forme Tableau
-display_cols = ['Mois', 'item total', 'order id', 'AOV', 'Growth %', 'Auto %', 'Accept %', 'Inactifs']
-rename_map = {
-    'item total': 'CA (MAD)', 
-    'order id': 'Commandes', 
-    'AOV': 'Panier Moy.',
-    'Accept %': 'Taux Accept.'
-}
-
-final_table = monthly_stats[display_cols].rename(columns=rename_map)
+final_table = monthly_stats[['Mois', 'item total', 'order id', 'AOV', 'Growth %', 'Auto %', 'Rejet/Cancel %', 'Inactifs']].rename(
+    columns={'item total': 'CA (MAD)', 'order id': 'Commandes', 'AOV': 'Panier Moy.'}
+)
 
 st.dataframe(
     final_table.style.format({
@@ -243,80 +213,119 @@ st.dataframe(
         "Panier Moy.": "{:.1f}",
         "Growth %": "{:+.1f}%",
         "Auto %": "{:.1f}%",
-        "Taux Accept.": "{:.1f}%",
+        "Rejet/Cancel %": "{:.1f}%",
         "Inactifs": "{:.0f}"
     }).background_gradient(subset=['Growth %'], cmap="RdYlGn", vmin=-20, vmax=20),
-    use_container_width=True,
-    hide_index=True
+    use_container_width=True, hide_index=True
 )
 
 st.divider()
 
 # ---------------------------------------------------------
-# 2. TOP FLOP & PROGRESSION (Automatique Derniers Mois)
+# 2. TOP & FLOP (SCROLLABLE)
 # ---------------------------------------------------------
-st.subheader("📈 Tops & 📉 Flops (Comparaison Automatique)")
+st.subheader("📈 Tops & 📉 Flops (Scrollable)")
 
 all_months = sorted(df['year_month'].unique())
 if len(all_months) >= 2:
-    last_month = all_months[-1] # Ex: Jan
-    prev_month = all_months[-2] # Ex: Dec
-    
+    last_month = all_months[-1]
+    prev_month = all_months[-2]
     st.info(f"Comparaison : **{last_month}** vs **{prev_month}**")
     
-    # Préparation des données pour la comparaison
-    # On utilise df_scope (déjà filtré par Scope et Enseigne)
-    df_m = df_scope[df_scope['year_month'] == last_month]
-    df_m_1 = df_scope[df_scope['year_month'] == prev_month]
-    
-    stats_m = df_m.groupby('restaurant name')['order id'].count()
-    stats_m_1 = df_m_1.groupby('restaurant name')['order id'].count()
+    stats_m = df_scope[df_scope['year_month'] == last_month].groupby('restaurant name')['order id'].count()
+    stats_m_1 = df_scope[df_scope['year_month'] == prev_month].groupby('restaurant name')['order id'].count()
     
     comp_df = pd.DataFrame({'Mois Préc': stats_m_1, 'Mois Actuel': stats_m}).fillna(0)
     comp_df['Delta'] = comp_df['Mois Actuel'] - comp_df['Mois Préc']
     
-    # On ajoute la colonne AM pour info
-    map_am = df.drop_duplicates('restaurant name').set_index('restaurant name')['AM'].to_dict()
-    comp_df['AM'] = comp_df.index.map(map_am)
-
-    # COLONNES
     col_flop, col_top = st.columns(2)
     
-    # --- FLOP (Régression) ---
     with col_flop:
         st.markdown("### 🚨 Top Régressions")
-        flops = comp_df[comp_df['Delta'] < 0].sort_values('Delta', ascending=True).head(10)
-        
+        flops = comp_df[comp_df['Delta'] < 0].sort_values('Delta', ascending=True)
         if not flops.empty:
             st.dataframe(
-                flops[['AM', 'Mois Préc', 'Mois Actuel', 'Delta']].style.format(
-                    {'Mois Préc': "{:.0f}", 'Mois Actuel': "{:.0f}", 'Delta': "{:.0f}"}
-                ).background_gradient(subset=['Delta'], cmap='Reds_r'),
-                use_container_width=True
+                flops[['Mois Préc', 'Mois Actuel', 'Delta']].style.format("{:.0f}").background_gradient(subset=['Delta'], cmap='Reds_r'),
+                use_container_width=True, 
+                height=300 # SCROLLABLE FIXED HEIGHT
             )
-        else:
-            st.success("Aucune baisse significative.")
+        else: st.success("Rien à signaler.")
 
-    # --- TOP (Progression) ---
     with col_top:
         st.markdown("### 🚀 Top Progressions")
-        tops = comp_df[comp_df['Delta'] > 0].sort_values('Delta', ascending=False).head(10)
-        
+        tops = comp_df[comp_df['Delta'] > 0].sort_values('Delta', ascending=False)
         if not tops.empty:
             st.dataframe(
-                tops[['AM', 'Mois Préc', 'Mois Actuel', 'Delta']].style.format(
-                    {'Mois Préc': "{:.0f}", 'Mois Actuel': "{:.0f}", 'Delta': "{:+.0f}"}
-                ).background_gradient(subset=['Delta'], cmap='Greens'),
-                use_container_width=True
+                tops[['Mois Préc', 'Mois Actuel', 'Delta']].style.format("{:.0f}").background_gradient(subset=['Delta'], cmap='Greens'),
+                use_container_width=True, 
+                height=300 # SCROLLABLE FIXED HEIGHT
             )
-        else:
-            st.info("Aucune hausse significative.")
-            
+        else: st.info("Rien à signaler.")
 else:
-    st.warning("Pas assez d'historique (besoin de 2 mois min) pour calculer les Tops/Flops.")
+    st.warning("Pas assez d'historique pour Top/Flop.")
+
+st.divider()
 
 # ---------------------------------------------------------
-# 3. DONNÉES BRUTES
+# 3. ANALYSE CROISÉE (CANCELLATION x DELIVERY TIME)
+# ---------------------------------------------------------
+st.subheader("🚫 Analyse des Annulations & Temps de Livraison")
+
+# On prépare les données par restaurant (sur la période sélectionnée globale ou tout l'historique dispo)
+# On calcule : Taux d'annulation, Temps moyen de livraison (pour les commandes livrées)
+resto_stats = df_scope.groupby('restaurant name').agg({
+    'order id': 'count',
+    'status': lambda x: x.astype(str).str.contains('Cancel|Reject', case=False).sum(),
+    'delivery time(M)': 'mean', # Temps de livraison moyen (pour celles livrées)
+    'AM': 'first' # Pour la couleur du graphe
+}).reset_index()
+
+resto_stats.columns = ['Restaurant', 'Total Orders', 'Cancelled', 'Avg Delivery Time (min)', 'AM']
+resto_stats['Cancellation Rate (%)'] = (resto_stats['Cancelled'] / resto_stats['Total Orders'] * 100).round(1)
+
+# Filtre pour éviter le bruit (ex: on garde seulement ceux > 5 commandes)
+resto_stats_clean = resto_stats[resto_stats['Total Orders'] >= 5]
+
+c1, c2 = st.columns([1, 2])
+
+with c1:
+    st.markdown("### ⚠️ Top Taux d'Annulation")
+    # Table scrollable des pires taux
+    top_cancel = resto_stats_clean.sort_values('Cancellation Rate (%)', ascending=False).head(50)
+    st.dataframe(
+        top_cancel[['Restaurant', 'Total Orders', 'Cancellation Rate (%)']].style.format({
+            'Total Orders': "{:.0f}", 
+            'Cancellation Rate (%)': "{:.1f}%"
+        }).background_gradient(subset=['Cancellation Rate (%)'], cmap='Reds'),
+        use_container_width=True,
+        height=400
+    )
+
+with c2:
+    st.markdown("### 📉 Corrélation : Temps de Livraison vs Annulation")
+    st.caption("Chaque bulle est un restaurant. Plus la bulle est haute, plus le taux d'annulation est élevé. Plus elle est à droite, plus le resto est lent.")
+    
+    if not resto_stats_clean.empty:
+        fig = px.scatter(
+            resto_stats_clean,
+            x='Avg Delivery Time (min)',
+            y='Cancellation Rate (%)',
+            size='Total Orders', # Taille de la bulle = Volume
+            color='AM', # Couleur par AM (si vue Global) ou unique
+            hover_name='Restaurant',
+            title="Impact de la Lenteur sur les Annulations",
+            template="plotly_white"
+        )
+        # Ligne moyenne
+        avg_cancel = resto_stats_clean['Cancellation Rate (%)'].mean()
+        fig.add_hline(y=avg_cancel, line_dash="dash", line_color="red", annotation_text="Moyenne Annulation")
+        
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Pas assez de données pour le graphique.")
+
+# ---------------------------------------------------------
+# 4. DATA RAW
 # ---------------------------------------------------------
 with st.expander("Voir les données brutes"):
     st.dataframe(df_scope)
