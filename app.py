@@ -120,10 +120,11 @@ pipelines_norm = load_pipelines()
 with st.sidebar:
     st.header("📂 Data")
     uploaded_file = st.file_uploader("Fichier CSV", type=['csv'])
+    
     # Auto-load local pour faciliter les tests
     if not uploaded_file:
         local = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
-        # Si le fichier local existe, on peut l'utiliser (décommenter si besoin)
+        # Si vous voulez tester en local sans upload, décommentez la ligne suivante
         # if os.path.exists(local): uploaded_file = local 
         pass
 
@@ -137,8 +138,6 @@ with st.sidebar:
     st.header("🔍 Filtres")
     
     # --- INTELLIGENCE DATE ---
-    # Par défaut, on sélectionne le DERNIER MOIS complet présent dans le fichier
-    # pour permettre la comparaison avec le mois d'avant.
     last_date = df['date'].max()
     first_date_of_month = last_date.replace(day=1)
     
@@ -179,8 +178,7 @@ for am in ['NAJWA', 'HOUDA', 'CHAIMA']:
     # Inactifs
     pipe = pipelines_norm.get(am, [])
     active = d_am['restaurant_norm'].unique().tolist()
-    # Logique Inactifs simplifiée (rapide)
-    # Combien de pipeline sont dans active ?
+    # Logique Inactifs
     matched = 0
     for p in pipe:
         if any(p in a for a in active): matched += 1
@@ -191,6 +189,7 @@ for am in ['NAJWA', 'HOUDA', 'CHAIMA']:
         "Pipeline": len(pipe), "Inactifs": inact
     })
 
+# Ici on utilise un dictionnaire de formatage, donc pas de problème pour les colonnes texte
 st.dataframe(pd.DataFrame(summary).style.format({"CA":"{:,.0f}","Growth %":"{:+.1f}%"}).background_gradient(subset=['Growth %'], cmap="Greens"), use_container_width=True)
 
 st.divider()
@@ -198,65 +197,56 @@ st.divider()
 # ---------------------------------------------------------
 # 2. FLOP AUTOMATIQUE (MOIS M vs MOIS M-1)
 # ---------------------------------------------------------
-# Cette section est indépendante du filtre date pour toujours montrer la vérité
 st.subheader("📉 Top Flops (Comparaison Automatique Derniers Mois)")
 
-# On identifie les deux derniers mois disponibles dans le fichier global
 all_months = sorted(df['year_month'].unique())
 if len(all_months) >= 2:
-    last_month = all_months[-1] # Ex: Jan 2026
-    prev_month = all_months[-2] # Ex: Dec 2025
+    last_month = all_months[-1]
+    prev_month = all_months[-2]
     
     col_info, col_table = st.columns([1, 3])
     with col_info:
         st.info(f"Comparaison de **{last_month}** par rapport à **{prev_month}**")
-        st.caption("Ce calcul prend les mois entiers disponibles dans le fichier.")
 
     with col_table:
-        # Data M
         df_m = df[df['year_month'] == last_month]
-        # Data M-1
         df_m_1 = df[df['year_month'] == prev_month]
         
-        # Filtre Enseigne si activé
         if sel_brand != 'Tous':
             df_m = df_m[df_m['Enseigne_Groupe'] == sel_brand]
             df_m_1 = df_m_1[df_m_1['Enseigne_Groupe'] == sel_brand]
 
-        # GroupBy
         stats_m = df_m.groupby('restaurant name')['order id'].count()
         stats_m_1 = df_m_1.groupby('restaurant name')['order id'].count()
         
-        # Merge
         flop_auto = pd.DataFrame({'Mois Préc': stats_m_1, 'Mois Actuel': stats_m}).fillna(0)
         flop_auto['Perte'] = flop_auto['Mois Actuel'] - flop_auto['Mois Préc']
         
-        # Récup AM
         map_am = df.drop_duplicates('restaurant name').set_index('restaurant name')['AM'].to_dict()
         flop_auto['AM'] = flop_auto.index.map(map_am)
         
-        # Filtrer Perte
         vrais_flops = flop_auto[flop_auto['Perte'] < 0].sort_values('Perte')
         
         if not vrais_flops.empty:
+            # CORRECTION ICI : Formatage spécifique par colonne
             st.dataframe(
-                vrais_flops[['AM', 'Mois Préc', 'Mois Actuel', 'Perte']].style.format("{:.0f}").background_gradient(subset=['Perte'], cmap='Reds_r'),
+                vrais_flops[['AM', 'Mois Préc', 'Mois Actuel', 'Perte']].style.format(
+                    {'Mois Préc': "{:.0f}", 'Mois Actuel': "{:.0f}", 'Perte': "{:.0f}"}
+                ).background_gradient(subset=['Perte'], cmap='Reds_r'),
                 use_container_width=True
             )
         else:
             st.success("Aucune régression entre ces deux mois.")
 else:
-    st.warning("Pas assez d'historique (moins de 2 mois) pour l'analyse automatique.")
+    st.warning("Pas assez d'historique.")
 
 # ---------------------------------------------------------
-# 3. RÉGRESSION PERSONNALISÉE (Selon Filtre Date)
+# 3. RÉGRESSION PERSONNALISÉE
 # ---------------------------------------------------------
 st.divider()
-st.subheader(f"🔍 Régression sur la période sélectionnée ({date_range[0]} au {date_range[1]})")
+st.subheader(f"🔍 Régression sur la période sélectionnée")
 
-# Calcul
 curr = df_filtered.groupby('restaurant name')['order id'].count()
-# Prev Period (déjà calculé df_prev)
 if sel_brand != 'Tous': df_prev = df_prev[df_prev['Enseigne_Groupe'] == sel_brand]
 prev = df_prev.groupby('restaurant name')['order id'].count()
 
@@ -267,6 +257,12 @@ reg_custom['AM'] = reg_custom.index.map(map_am)
 flops_custom = reg_custom[reg_custom['Delta'] < 0].sort_values('Delta')
 
 if not flops_custom.empty:
-    st.dataframe(flops_custom[['AM', 'Avant', 'Pendant', 'Delta']].style.format("{:.0f}").background_gradient(subset=['Delta'], cmap='Reds_r'), use_container_width=True)
+    # CORRECTION ICI : Formatage spécifique par colonne
+    st.dataframe(
+        flops_custom[['AM', 'Avant', 'Pendant', 'Delta']].style.format(
+            {'Avant': "{:.0f}", 'Pendant': "{:.0f}", 'Delta': "{:.0f}"}
+        ).background_gradient(subset=['Delta'], cmap='Reds_r'),
+        use_container_width=True
+    )
 else:
     st.info("Aucune régression sur cette plage de dates spécifique.")
