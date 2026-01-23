@@ -1,84 +1,52 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import os
 import unicodedata
 from datetime import timedelta
 
 # ---------------------------------------------------------
-# CONFIGURATION DE LA PAGE
+# CONFIGURATION
 # ---------------------------------------------------------
-st.set_page_config(
-    page_title="DASH-SBN | Performance & Pipeline",
-    page_icon="🚀",
-    layout="wide"
-)
+st.set_page_config(page_title="DASH-SBN | Analytics", page_icon="📉", layout="wide")
 
 # ---------------------------------------------------------
-# FONCTIONS UTILITAIRES (NORMALISATION)
+# UTILITAIRES
 # ---------------------------------------------------------
 def normalize_text(text):
-    """
-    Nettoie le texte pour le matching :
-    - Enlève les accents (é -> e)
-    - Minuscule
-    - Enlève la ponctuation et les espaces superflus
-    """
     if pd.isna(text): return ""
-    # Normalisation unicode (sépare les accents des lettres)
     text = str(text)
-    nfkd_form = unicodedata.normalize('NFKD', text)
-    # Garde uniquement les caractères ASCII (enlève les accents)
-    text_ascii = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
-    # Minuscule et strip
-    return text_ascii.lower().strip()
+    nfkd = unicodedata.normalize('NFKD', text)
+    ascii_text = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    return ascii_text.lower().strip()
 
 # ---------------------------------------------------------
-# CHARGEMENT DES PIPELINES (AM)
+# CHARGEMENT
 # ---------------------------------------------------------
 @st.cache_data
 def load_pipelines():
-    """Charge les listes de restaurants (Pipelines) depuis les fichiers CSV AM."""
-    pipelines_norm = {} # Dictionnaire {AM: [liste_noms_normalisés]}
-    
+    pipelines_norm = {}
     am_files = {'NAJWA': 'NAJWA.csv', 'HOUDA': 'HOUDA.csv', 'CHAIMA': 'CHAIMA.csv'}
-    
     for am, filename in am_files.items():
         if os.path.exists(filename):
             try:
-                # Lecture flexible (virgule ou point-virgule)
                 try:
-                    df_p = pd.read_csv(filename, sep=',')
-                    if len(df_p.columns) < 2: raise ValueError
+                    df = pd.read_csv(filename, sep=',')
+                    if len(df.columns)<2: raise ValueError
                 except:
-                    df_p = pd.read_csv(filename, sep=';')
+                    df = pd.read_csv(filename, sep=';')
                 
-                # Trouver la colonne qui contient le nom
-                df_p.columns = df_p.columns.str.strip().str.lower()
-                # On cherche une colonne qui contient 'restaurant' ou 'name', sinon la 1ère
-                col_name = next((c for c in df_p.columns if 'restaurant' in c or 'name' in c), df_p.columns[0])
-                
-                # Création de la liste normalisée
-                raw_list = df_p[col_name].dropna().astype(str).tolist()
-                pipelines_norm[am] = [normalize_text(x) for x in raw_list]
-                
-            except Exception:
-                pipelines_norm[am] = []
-        else:
-            pipelines_norm[am] = []
-            
+                df.columns = df.columns.str.strip().str.lower()
+                col = next((c for c in df.columns if 'restaurant' in c or 'name' in c), df.columns[0])
+                pipelines_norm[am] = [normalize_text(x) for x in df[col].dropna().astype(str).tolist()]
+            except: pipelines_norm[am] = []
+        else: pipelines_norm[am] = []
     return pipelines_norm
 
-# ---------------------------------------------------------
-# CHARGEMENT ET TRAITEMENT DES DONNÉES COMMANDES
-# ---------------------------------------------------------
 @st.cache_data
 def load_data(main_file, pipelines_norm):
-    # 1. Lecture Robuste
     if hasattr(main_file, 'seek'): main_file.seek(0)
     try:
         df = pd.read_csv(main_file, sep=',')
-        # Vérif si mal lu
         if 'order day' not in df.columns and len(df.columns) < 5: raise ValueError
     except:
         if hasattr(main_file, 'seek'): main_file.seek(0)
@@ -86,12 +54,11 @@ def load_data(main_file, pipelines_norm):
 
     df.columns = df.columns.str.strip()
     
-    # 2. Parsing Dates
+    # Dates
     df['order day'] = df['order day'].astype(str)
     df['order time'] = df['order time'].astype(str)
     
     def parse_dt(d_str):
-        # Tente plusieurs formats
         for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d'):
             try: return pd.to_datetime(d_str, format=fmt)
             except: continue
@@ -99,303 +66,207 @@ def load_data(main_file, pipelines_norm):
 
     df['order_date_obj'] = df['order day'].apply(parse_dt)
     df['order_datetime'] = pd.to_datetime(
-        df['order_date_obj'].dt.strftime('%Y-%m-%d') + ' ' + df['order time'], 
-        errors='coerce'
+        df['order_date_obj'].dt.strftime('%Y-%m-%d') + ' ' + df['order time'], errors='coerce'
     )
     df['date'] = df['order_datetime'].dt.date
-    # Pour le tri mensuel
     df['year_month'] = df['order_datetime'].dt.to_period('M')
-    
-    # 3. Nettoyage Numérique
-    for c in ['item total', 'delivery amount', 'Distance travel']:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
-    # 4. Normalisation du nom du restaurant (Clé de jointure)
+    # Numérique
+    for c in ['item total', 'delivery amount']:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+
+    # Attribution AM
     df['restaurant_norm'] = df['restaurant name'].apply(normalize_text)
-
-    # 5. Attribution AM (Logique : Pipeline > Grand Compte > Ville > Défaut)
+    
     def get_am(row):
         r_norm = row['restaurant_norm']
         city = str(row.get('city', '')).lower()
         r_raw = str(row.get('restaurant name', '')).lower()
-
-        # A. Check Pipeline (Match Exact ou Partiel Normalisé)
-        for am, resto_list_norm in pipelines_norm.items():
-            # Test 1: Le nom de la commande est dans la liste pipeline
-            if r_norm in resto_list_norm:
-                return am
-            # Test 2: Inclusions (ex: "mcdo maarif" contient "mcdo")
-            # Attention aux faux positifs courts, on filtre len > 3
-            for p_norm in resto_list_norm:
-                if len(p_norm) > 3 and (p_norm in r_norm):
-                    return am
-
-        # B. Fallback Logique "Hardcodée"
-        if any(x in r_raw for x in ['mcdonald', 'kfc', 'burger king', 'primos', 'papa john', 'quick']): return 'NAJWA'
+        
+        for am, p_list in pipelines_norm.items():
+            if r_norm in p_list: return am
+            for p in p_list:
+                if len(p)>3 and p in r_norm: return am
+        
+        if any(x in r_raw for x in ['mcdonald', 'kfc', 'burger king', 'primos', 'papa john']): return 'NAJWA'
         if any(c in city for c in ['rabat', 'sale', 'temara', 'kenitra']): return 'HOUDA'
         return 'CHAIMA'
 
     df['AM'] = df.apply(get_am, axis=1)
 
-    # 6. Automatisation
+    # Automatisation
     if 'Assigned By' in df.columns:
         df['is_automated'] = df['Assigned By'].astype(str).str.contains('Algorithm|super_app', case=False, regex=True)
-    else:
-        df['is_automated'] = False
-        
-    # 7. Groupement Enseigne
+    else: df['is_automated'] = False
+    
+    # Enseigne
     def get_brand(name):
         n = normalize_text(name)
         if 'mcdonald' in n: return "McDonald's"
         if 'kfc' in n: return "KFC"
         if 'burger king' in n: return "Burger King"
-        if 'chrono pizza' in n: return "Chrono Pizza"
-        if 'sushi' in n or 'asia' in n: return "Asian/Sushi"
-        if 'tacos' in n: return "Tacos"
+        if 'primos' in n: return "Primos"
         return "Autres"
-    
     df['Enseigne_Groupe'] = df['restaurant name'].apply(get_brand)
 
     return df
 
 # ---------------------------------------------------------
-# INTERFACE PRINCIPALE
+# APP
 # ---------------------------------------------------------
-st.title("🚀 DASH-SBN | Monitoring & Pipeline")
-
-# Chargement des Pipelines au démarrage
+st.title("🚀 DASH-SBN | Monitoring")
 pipelines_norm = load_pipelines()
 
-# --- SIDEBAR ---
 with st.sidebar:
-    st.header("📂 Sources")
-    uploaded_file = st.file_uploader("Fichier Commandes (CSV)", type=['csv'])
-    
-    # Fallback pour démo locale (Optionnel)
+    st.header("📂 Data")
+    uploaded_file = st.file_uploader("Fichier CSV", type=['csv'])
+    # Auto-load local pour faciliter les tests
     if not uploaded_file:
-        local_path = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
-        if os.path.exists(local_path):
-            # On ne charge pas auto pour laisser l'utilisateur upload, 
-            # sauf si vous voulez forcer le mode démo.
-            pass
+        local = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
+        # Si le fichier local existe, on peut l'utiliser (décommenter si besoin)
+        # if os.path.exists(local): uploaded_file = local 
+        pass
 
     if uploaded_file:
         df = load_data(uploaded_file, pipelines_norm)
     else:
-        st.info("Veuillez charger le fichier de commandes.")
+        st.info("Chargez le fichier.")
         st.stop()
         
     st.divider()
     st.header("🔍 Filtres")
     
-    # Sélecteur de Période
-    if not df.empty:
-        min_d, max_d = df['date'].min(), df['date'].max()
-        date_range = st.date_input("Période Analysée", [min_d, max_d])
-    else:
-        st.stop()
+    # --- INTELLIGENCE DATE ---
+    # Par défaut, on sélectionne le DERNIER MOIS complet présent dans le fichier
+    # pour permettre la comparaison avec le mois d'avant.
+    last_date = df['date'].max()
+    first_date_of_month = last_date.replace(day=1)
     
-    # Sélecteur Enseigne
+    date_range = st.date_input("Période", [first_date_of_month, last_date])
+    
     all_brands = ['Tous'] + sorted(df['Enseigne_Groupe'].unique().tolist())
-    sel_brand = st.selectbox("Enseigne / Groupe", all_brands)
+    sel_brand = st.selectbox("Enseigne", all_brands)
 
-# --- FILTRAGE PRINCIPAL ---
+# FILTRE
 mask = (df['date'] >= date_range[0]) & (df['date'] <= date_range[1])
 if sel_brand != 'Tous': mask &= (df['Enseigne_Groupe'] == sel_brand)
 df_filtered = df.loc[mask]
 
 if df_filtered.empty:
-    st.warning("⚠️ Aucune donnée pour cette sélection. Essayez d'élargir la période.")
+    st.warning("Aucune donnée sur cette période.")
     st.stop()
 
 # ---------------------------------------------------------
-# 1. TABLEAU DE BORD KPI (AM)
+# 1. KPI GLOBAL (AM)
 # ---------------------------------------------------------
-st.subheader("📊 Performance par Account Manager (AM)")
-
-# On prépare la comparaison temporelle pour le "Growth" global du tableau
-# Période précédente = même durée juste avant la date de début
+st.subheader("📊 Performance par AM")
+# Comparaison Période (Même durée avant)
 delta_days = (date_range[1] - date_range[0]).days + 1
 prev_start = date_range[0] - timedelta(days=delta_days)
 prev_end = date_range[0] - timedelta(days=1)
-# Dataset global pour aller chercher l'historique hors filtre date actuel
-df_prev_period = df[(df['date'] >= prev_start) & (df['date'] <= prev_end)]
+df_prev = df[(df['date'] >= prev_start) & (df['date'] <= prev_end)]
 
-summary_data = []
-ams_list = ['NAJWA', 'HOUDA', 'CHAIMA']
+summary = []
+for am in ['NAJWA', 'HOUDA', 'CHAIMA']:
+    d_am = df_filtered[df_filtered['AM']==am]
+    rev = d_am['item total'].sum()
+    orders = len(d_am)
+    
+    # Growth
+    rev_prev = df_prev[df_prev['AM']==am]['item total'].sum()
+    growth = ((rev - rev_prev)/rev_prev*100) if rev_prev > 0 else 0
+    
+    # Inactifs
+    pipe = pipelines_norm.get(am, [])
+    active = d_am['restaurant_norm'].unique().tolist()
+    # Logique Inactifs simplifiée (rapide)
+    # Combien de pipeline sont dans active ?
+    matched = 0
+    for p in pipe:
+        if any(p in a for a in active): matched += 1
+    inact = max(0, len(pipe) - matched)
 
-for am in ams_list:
-    # Données actuelles
-    data_am = df_filtered[df_filtered['AM'] == am]
-    
-    # Metrics
-    ca = data_am['item total'].sum()
-    orders = len(data_am)
-    aov = ca / orders if orders > 0 else 0
-    
-    # Taux
-    auto_rate = (data_am['is_automated'].sum() / orders * 100) if orders > 0 else 0
-    rejects = data_am[data_am['status'] == 'Restaurant Rejected'].shape[0]
-    acc_rate = ((orders - rejects) / orders * 100) if orders > 0 else 100
-    
-    # Inactifs (Comparaison Pipeline vs Actifs Normalisés)
-    pipeline = pipelines_norm.get(am, [])
-    total_pipeline = len(pipeline)
-    
-    active_norm = data_am['restaurant_norm'].unique().tolist()
-    
-    # Compter les inactifs
-    actives_in_pipeline = 0
-    for p_norm in pipeline:
-        # Est-ce que ce resto du pipeline a été actif ?
-        # On vérifie si p_norm est contenu dans un des noms actifs ou l'inverse
-        is_active = False
-        if p_norm in active_norm:
-            is_active = True
-        else:
-            # Recherche flexible
-            for a_n in active_norm:
-                if p_norm in a_n: 
-                    is_active = True
-                    break
-        if is_active: actives_in_pipeline += 1
-            
-    inactifs = max(0, total_pipeline - actives_in_pipeline)
-    
-    # Growth (vs Période Précédente)
-    prev_ca = df_prev_period[df_prev_period['AM'] == am]['item total'].sum()
-    growth = ((ca - prev_ca) / prev_ca * 100) if prev_ca > 0 else 0
-
-    summary_data.append({
-        "AM": am,
-        "CA (MAD)": ca,
-        "Panier Moy.": aov,
-        "Commandes": orders,
-        "Growth (%)": growth,
-        "Auto (%)": auto_rate,
-        "Accept. (%)": acc_rate,
-        "Pipeline Total": total_pipeline,
-        "Inactifs": inactifs
+    summary.append({
+        "AM": am, "CA": rev, "Commandes": orders, "Growth %": growth, 
+        "Pipeline": len(pipe), "Inactifs": inact
     })
 
-df_summary = pd.DataFrame(summary_data)
-
-# Affichage avec style
-st.dataframe(
-    df_summary.style.format({
-        "CA (MAD)": "{:,.0f}",
-        "Panier Moy.": "{:.1f}",
-        "Growth (%)": "{:+.1f}%",
-        "Auto (%)": "{:.1f}%",
-        "Accept. (%)": "{:.1f}%",
-        "Pipeline Total": "{:.0f}",
-        "Inactifs": "{:.0f}"
-    }).background_gradient(subset=['Growth (%)', 'CA (MAD)'], cmap="Greens"),
-    use_container_width=True,
-    hide_index=True
-)
+st.dataframe(pd.DataFrame(summary).style.format({"CA":"{:,.0f}","Growth %":"{:+.1f}%"}).background_gradient(subset=['Growth %'], cmap="Greens"), use_container_width=True)
 
 st.divider()
 
 # ---------------------------------------------------------
-# 2. ANALYSE MENSUELLE (MONTH OVER MONTH)
+# 2. FLOP AUTOMATIQUE (MOIS M vs MOIS M-1)
 # ---------------------------------------------------------
-st.subheader("📅 Évolution Mensuelle (Historique)")
+# Cette section est indépendante du filtre date pour toujours montrer la vérité
+st.subheader("📉 Top Flops (Comparaison Automatique Derniers Mois)")
 
-# On prend tout l'historique disponible qui correspond au filtre Enseigne
-mask_brand_hist = (df['Enseigne_Groupe'] == sel_brand) if sel_brand != 'Tous' else [True] * len(df)
-df_history = df[mask_brand_hist].copy()
+# On identifie les deux derniers mois disponibles dans le fichier global
+all_months = sorted(df['year_month'].unique())
+if len(all_months) >= 2:
+    last_month = all_months[-1] # Ex: Jan 2026
+    prev_month = all_months[-2] # Ex: Dec 2025
+    
+    col_info, col_table = st.columns([1, 3])
+    with col_info:
+        st.info(f"Comparaison de **{last_month}** par rapport à **{prev_month}**")
+        st.caption("Ce calcul prend les mois entiers disponibles dans le fichier.")
 
-if not df_history.empty:
-    # Agrégation par Mois
-    monthly = df_history.groupby('year_month').agg({
-        'item total': 'sum',
-        'order id': 'count',
-        'is_automated': 'mean'
-    }).reset_index().sort_values('year_month')
-    
-    monthly['Mois'] = monthly['year_month'].dt.strftime('%Y-%m')
-    
-    # Calcul Variation MoM (Mois actuel vs Mois précédent)
-    monthly['CA Précédent'] = monthly['item total'].shift(1)
-    monthly['Growth MoM (%)'] = ((monthly['item total'] - monthly['CA Précédent']) / monthly['CA Précédent'] * 100).fillna(0)
-    
-    # Mise en forme pour affichage
-    monthly_show = monthly[['Mois', 'item total', 'Growth MoM (%)', 'order id', 'is_automated']].copy()
-    monthly_show.columns = ['Mois', 'CA (MAD)', 'Croissance MoM (%)', 'Commandes', 'Auto (%)']
-    monthly_show['Auto (%)'] *= 100 # Passage en pourcentage
+    with col_table:
+        # Data M
+        df_m = df[df['year_month'] == last_month]
+        # Data M-1
+        df_m_1 = df[df['year_month'] == prev_month]
+        
+        # Filtre Enseigne si activé
+        if sel_brand != 'Tous':
+            df_m = df_m[df_m['Enseigne_Groupe'] == sel_brand]
+            df_m_1 = df_m_1[df_m_1['Enseigne_Groupe'] == sel_brand]
 
-    st.dataframe(
-        monthly_show.style.format({
-            "CA (MAD)": "{:,.0f}",
-            "Croissance MoM (%)": "{:+.1f}%",
-            "Commandes": "{:.0f}",
-            "Auto (%)": "{:.1f}%"
-        }).background_gradient(subset=['Croissance MoM (%)'], cmap="RdYlGn", vmin=-20, vmax=20),
-        use_container_width=True,
-        hide_index=True
-    )
+        # GroupBy
+        stats_m = df_m.groupby('restaurant name')['order id'].count()
+        stats_m_1 = df_m_1.groupby('restaurant name')['order id'].count()
+        
+        # Merge
+        flop_auto = pd.DataFrame({'Mois Préc': stats_m_1, 'Mois Actuel': stats_m}).fillna(0)
+        flop_auto['Perte'] = flop_auto['Mois Actuel'] - flop_auto['Mois Préc']
+        
+        # Récup AM
+        map_am = df.drop_duplicates('restaurant name').set_index('restaurant name')['AM'].to_dict()
+        flop_auto['AM'] = flop_auto.index.map(map_am)
+        
+        # Filtrer Perte
+        vrais_flops = flop_auto[flop_auto['Perte'] < 0].sort_values('Perte')
+        
+        if not vrais_flops.empty:
+            st.dataframe(
+                vrais_flops[['AM', 'Mois Préc', 'Mois Actuel', 'Perte']].style.format("{:.0f}").background_gradient(subset=['Perte'], cmap='Reds_r'),
+                use_container_width=True
+            )
+        else:
+            st.success("Aucune régression entre ces deux mois.")
 else:
-    st.info("Pas assez de données pour l'historique.")
+    st.warning("Pas assez d'historique (moins de 2 mois) pour l'analyse automatique.")
 
+# ---------------------------------------------------------
+# 3. RÉGRESSION PERSONNALISÉE (Selon Filtre Date)
+# ---------------------------------------------------------
 st.divider()
+st.subheader(f"🔍 Régression sur la période sélectionnée ({date_range[0]} au {date_range[1]})")
 
-# ---------------------------------------------------------
-# 3. RÉGRESSION (TOP FLOP) - CORRIGÉ
-# ---------------------------------------------------------
-st.subheader("🚨 Restaurants en Régression (Volume Commandes)")
-col_reg1, col_reg2 = st.columns([3, 1])
+# Calcul
+curr = df_filtered.groupby('restaurant name')['order id'].count()
+# Prev Period (déjà calculé df_prev)
+if sel_brand != 'Tous': df_prev = df_prev[df_prev['Enseigne_Groupe'] == sel_brand]
+prev = df_prev.groupby('restaurant name')['order id'].count()
 
-with col_reg1:
-    # 1. Map de référence {Resto -> AM} pour éviter les trous
-    # On prend le dernier AM connu pour chaque resto
-    resto_am_map = df.sort_values('date').drop_duplicates('restaurant name', keep='last').set_index('restaurant name')['AM'].to_dict()
+reg_custom = pd.DataFrame({'Avant': prev, 'Pendant': curr}).fillna(0)
+reg_custom['Delta'] = reg_custom['Pendant'] - reg_custom['Avant']
+reg_custom['AM'] = reg_custom.index.map(map_am)
 
-    # 2. Données Précédentes (filtrées par enseigne si besoin)
-    if sel_brand != 'Tous':
-        df_prev_filter = df_prev_period[df_prev_period['Enseigne_Groupe'] == sel_brand]
-    else:
-        df_prev_filter = df_prev_period
+flops_custom = reg_custom[reg_custom['Delta'] < 0].sort_values('Delta')
 
-    # 3. GroupBy
-    curr_counts = df_filtered.groupby('restaurant name')['order id'].count().reset_index().rename(columns={'order id': 'Orders Current'})
-    prev_counts = df_prev_filter.groupby('restaurant name')['order id'].count().reset_index().rename(columns={'order id': 'Orders Prev'})
-    
-    # 4. Fusion
-    reg_df = pd.merge(curr_counts, prev_counts, on='restaurant name', how='outer').fillna(0)
-    
-    # 5. Calcul Delta
-    reg_df['Delta'] = reg_df['Orders Current'] - reg_df['Orders Prev']
-    
-    # 6. Récupération AM sécurisée
-    reg_df['AM'] = reg_df['restaurant name'].map(resto_am_map).fillna('Autre')
-    
-    # 7. Filtre et Tri
-    flop_df = reg_df[reg_df['Delta'] < 0].sort_values('Delta', ascending=True)
-    
-    if not flop_df.empty:
-        st.dataframe(
-            flop_df[['restaurant name', 'AM', 'Orders Prev', 'Orders Current', 'Delta']].style.format({
-                'Orders Prev': '{:.0f}',
-                'Orders Current': '{:.0f}',
-                'Delta': '{:.0f}'
-            }).background_gradient(subset=['Delta'], cmap="Reds_r"),
-            use_container_width=True
-        )
-    else:
-        st.success("Aucune régression détectée sur cette période !")
-
-with col_reg2:
-    st.markdown("**Comparaison :**")
-    st.caption(f"Actuel : {date_range[0]} au {date_range[1]}")
-    st.caption(f"Précédent : {prev_start} au {prev_end}")
-    if not flop_df.empty:
-        perte = flop_df['Delta'].sum()
-        st.error(f"Perte Totale : {perte:.0f} commandes")
-
-# ---------------------------------------------------------
-# 4. DATA DETAIL
-# ---------------------------------------------------------
-with st.expander("Voir les données brutes"):
-    st.dataframe(df_filtered)
+if not flops_custom.empty:
+    st.dataframe(flops_custom[['AM', 'Avant', 'Pendant', 'Delta']].style.format("{:.0f}").background_gradient(subset=['Delta'], cmap='Reds_r'), use_container_width=True)
+else:
+    st.info("Aucune régression sur cette plage de dates spécifique.")
