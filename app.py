@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import io
 
 # ---------------------------------------------------------
 # CONFIGURATION DE LA PAGE
@@ -13,7 +14,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------
-# CSS PERSONNALISÉ (Optionnel - pour le look)
+# CSS PERSONNALISÉ
 # ---------------------------------------------------------
 st.markdown("""
     <style>
@@ -34,36 +35,74 @@ st.markdown("""
 # ---------------------------------------------------------
 @st.cache_data
 def load_data(file):
-    # Lecture du fichier avec le séparateur point-virgule
-    try:
-        df = pd.read_csv(file, sep=';')
-    except:
-        # Fallback si le séparateur est différent
-        df = pd.read_csv(file, sep=',')
+    # Fonction pour remettre le curseur au début du fichier (essentiel pour Streamlit)
+    def reset_buffer(f):
+        if hasattr(f, 'seek'):
+            f.seek(0)
 
-    # 1. Conversion des Dates
-    # On combine 'order day' et 'order time' pour avoir un datetime complet
-    # Format attendu dans le fichier exemple : dd/mm/yyyy
+    # 1. Détection et Lecture Robuste
+    df = None
+    # Essai 1 : Virgule (Standard CSV)
+    try:
+        reset_buffer(file)
+        df = pd.read_csv(file, sep=',')
+        if 'order day' not in df.columns and len(df.columns) < 5:
+            raise ValueError("Mauvais séparateur")
+    except:
+        # Essai 2 : Point-virgule (Excel CSV Europe)
+        try:
+            reset_buffer(file)
+            df = pd.read_csv(file, sep=';')
+        except:
+            st.error("❌ Impossible de lire le fichier. Vérifiez qu'il s'agit bien d'un CSV.")
+            st.stop()
+    
+    # Nettoyage des noms de colonnes (enlève espaces avant/après)
+    df.columns = df.columns.str.strip()
+
+    # Vérification de la colonne critique
+    if 'order day' not in df.columns:
+        st.error("⚠️ Colonne 'order day' manquante. Colonnes détectées :")
+        st.write(df.columns.tolist())
+        st.stop()
+
+    # 2. Conversion des Dates (Gestion multi-formats)
+    # On nettoie d'abord les colonnes date pour éviter les erreurs de type
+    df['order day'] = df['order day'].astype(str)
+    df['order time'] = df['order time'].astype(str)
+
+    # Fonction de parsing date flexible
+    def parse_dates(date_str):
+        for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d'):
+            try:
+                return pd.to_datetime(date_str, format=fmt)
+            except ValueError:
+                continue
+        return pd.to_datetime(date_str, errors='coerce')
+
+    # Application de la conversion
+    df['order_date_obj'] = df['order day'].apply(parse_dates)
+    
+    # Création du champ datetime complet
     df['order_datetime'] = pd.to_datetime(
-        df['order day'] + ' ' + df['order time'], 
-        format='%d/%m/%Y %H:%M:%S', 
+        df['order_date_obj'].dt.strftime('%Y-%m-%d') + ' ' + df['order time'], 
         errors='coerce'
     )
+    
     df['date'] = df['order_datetime'].dt.date
     df['month_str'] = df['order_datetime'].dt.strftime('%Y-%m')
 
-    # 2. Nettoyage des colonnes numériques
+    # 3. Nettoyage des colonnes numériques
     numeric_cols = ['item total', 'delivery amount', 'Distance travel']
     for col in numeric_cols:
         if col in df.columns:
-            # Gestion des virgules si nécessaire, sinon conversion directe
+            # Force la conversion en nombre, remplace les erreurs par 0
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # 3. Logique d'attribution des Account Managers (AM)
+    # 4. Logique d'attribution des Account Managers (AM)
     def assign_am(row):
-        # Normalisation en minuscules pour la recherche
-        rest_name = str(row['restaurant name']).lower()
-        city = str(row['city']).lower()
+        rest_name = str(row.get('restaurant name', '')).lower()
+        city = str(row.get('city', '')).lower()
         
         # Liste des Grands Comptes (NAJWA)
         key_accounts = [
@@ -87,9 +126,11 @@ def load_data(file):
 
     df['AM'] = df.apply(assign_am, axis=1)
 
-    # 4. Logique d'Automatisation
-    # On considère automatisé si "Assigned By" contient "Algorithm" ou "super_app"
-    df['is_automated'] = df['Assigned By'].astype(str).str.contains('Algorithm|super_app', case=False, regex=True)
+    # 5. Logique d'Automatisation
+    if 'Assigned By' in df.columns:
+        df['is_automated'] = df['Assigned By'].astype(str).str.contains('Algorithm|super_app', case=False, regex=True)
+    else:
+        df['is_automated'] = False
     
     return df
 
@@ -98,7 +139,7 @@ def load_data(file):
 # ---------------------------------------------------------
 
 # Titre
-st.title("🚀 DASH-SBN : Monitoring de Performance")
+st.title("🚀 DASH-SBN | Performance Analytics")
 st.markdown("Analyse des ventes, opérations et performance des Account Managers.")
 
 # Sidebar pour l'upload et les filtres
@@ -106,42 +147,40 @@ with st.sidebar:
     st.header("Paramètres")
     uploaded_file = st.file_uploader("Charger le fichier CSV (Export Admin)", type=['csv'])
     
-    # Fallback pour le test si pas de fichier uploadé (à adapter avec votre chemin local par défaut)
-    default_file = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
-    
+    df = None
     if uploaded_file is not None:
-        data_source = uploaded_file
+        df = load_data(uploaded_file)
     else:
-        # Essayer de charger le fichier local s'il existe
-        import os
-        if os.path.exists(default_file):
-            data_source = default_file
-        else:
-            st.warning("Veuillez uploader un fichier CSV.")
-            st.stop()
-
-    # Chargement des données
-    df = load_data(data_source)
+        st.info("Veuillez uploader un fichier CSV pour commencer.")
+        st.stop()
 
     # Filtres
     st.subheader("Filtres")
     
     # Sélecteur d'AM
-    am_options = ['Global'] + list(df['AM'].unique())
+    am_options = ['Global'] + sorted(list(df['AM'].unique()))
     selected_am = st.selectbox("Choisir l'Account Manager (AM)", am_options)
     
     # Sélecteur de Date
-    min_date = df['date'].min()
-    max_date = df['date'].max()
-    date_range = st.date_input("Période", [min_date, max_date])
+    if not df['date'].isna().all():
+        min_date = df['date'].min()
+        max_date = df['date'].max()
+        date_range = st.date_input("Période", [min_date, max_date])
+    else:
+        st.warning("Problème avec les dates dans le fichier.")
+        st.stop()
 
 # ---------------------------------------------------------
 # LOGIQUE DE FILTRAGE
 # ---------------------------------------------------------
 
 # 1. Filtre Date
-if len(date_range) == 2:
+if isinstance(date_range, list) and len(date_range) == 2:
     mask_date = (df['date'] >= date_range[0]) & (df['date'] <= date_range[1])
+    df_filtered = df.loc[mask_date]
+elif isinstance(date_range, list) and len(date_range) == 1:
+    # Cas où l'utilisateur n'a sélectionné qu'une date de début
+    mask_date = (df['date'] >= date_range[0])
     df_filtered = df.loc[mask_date]
 else:
     df_filtered = df.copy()
@@ -160,8 +199,8 @@ total_revenue = df_filtered['item total'].sum()
 aov = total_revenue / total_orders if total_orders > 0 else 0
 
 # Taux d'annulation
-# Statuts indiquant une annulation (à adapter selon vos statuts exacts)
-cancel_statuses = ['Cancelled', 'Canceled', 'Cancelled by user', 'Restaurant Rejected']
+# Statuts indiquant une annulation
+cancel_statuses = ['Cancelled', 'Canceled', 'Cancelled by user', 'Restaurant Rejected', 'Auto Cancelled']
 cancelled_orders = df_filtered[df_filtered['status'].isin(cancel_statuses)].shape[0]
 cancel_rate = (cancelled_orders / total_orders * 100) if total_orders > 0 else 0
 
@@ -228,26 +267,29 @@ with c2:
 st.subheader("📊 Détail de la Performance Mensuelle")
 
 # Tableau croisé dynamique par Mois
-monthly_kpis = df_filtered.groupby('month_str').agg({
-    'item total': 'sum',
-    'order id': 'count',
-    'is_automated': 'mean' # Cela donne le % directement
-}).reset_index()
+if not df_filtered.empty:
+    monthly_kpis = df_filtered.groupby('month_str').agg({
+        'item total': 'sum',
+        'order id': 'count',
+        'is_automated': 'mean'
+    }).reset_index()
 
-monthly_kpis.columns = ['Mois', 'Chiffre d\'Affaires', 'Commandes', '% Auto']
-monthly_kpis['% Auto'] = (monthly_kpis['% Auto'] * 100).round(1)
-monthly_kpis['Panier Moyen'] = (monthly_kpis['Chiffre d\'Affaires'] / monthly_kpis['Commandes']).round(1)
+    monthly_kpis.columns = ['Mois', 'Chiffre d\'Affaires', 'Commandes', '% Auto']
+    monthly_kpis['% Auto'] = (monthly_kpis['% Auto'] * 100).round(1)
+    monthly_kpis['Panier Moyen'] = (monthly_kpis['Chiffre d\'Affaires'] / monthly_kpis['Commandes']).round(1)
 
-# Calcul Growth (Croissance CA)
-monthly_kpis['Croissance (%)'] = monthly_kpis['Chiffre d\'Affaires'].pct_change().mul(100).round(1).fillna(0)
+    # Calcul Growth (Croissance CA)
+    monthly_kpis['Croissance (%)'] = monthly_kpis['Chiffre d\'Affaires'].pct_change().mul(100).round(1).fillna(0)
 
-# Réordonner les colonnes
-monthly_kpis = monthly_kpis[['Mois', 'Chiffre d\'Affaires', 'Croissance (%)', 'Commandes', 'Panier Moyen', '% Auto']]
+    # Réordonner les colonnes
+    monthly_kpis = monthly_kpis[['Mois', 'Chiffre d\'Affaires', 'Croissance (%)', 'Commandes', 'Panier Moyen', '% Auto']]
 
-st.dataframe(monthly_kpis, use_container_width=True, hide_index=True)
+    st.dataframe(monthly_kpis, use_container_width=True, hide_index=True)
+else:
+    st.info("Aucune donnée disponible pour la période sélectionnée.")
 
 # ---------------------------------------------------------
-# APERÇU DES DONNÉES BRUTES (Optionnel)
+# APERÇU DES DONNÉES BRUTES
 # ---------------------------------------------------------
 with st.expander("Voir les données brutes"):
     st.dataframe(df_filtered)
