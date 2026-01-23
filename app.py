@@ -1,17 +1,16 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import os
 import unicodedata
 from datetime import timedelta
 
 # ---------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION DE LA PAGE
 # ---------------------------------------------------------
 st.set_page_config(
     page_title="DASH-SBN | Performance & Pipeline",
-    page_icon="📉",
+    page_icon="🚀",
     layout="wide"
 )
 
@@ -35,49 +34,51 @@ def normalize_text(text):
     return text_ascii.lower().strip()
 
 # ---------------------------------------------------------
-# FONCTIONS DE CHARGEMENT
+# CHARGEMENT DES PIPELINES (AM)
 # ---------------------------------------------------------
 @st.cache_data
 def load_pipelines():
     """Charge les listes de restaurants (Pipelines) depuis les fichiers CSV AM."""
-    pipelines = {}
-    # On stocke aussi la version normalisée pour le matching
-    pipelines_norm = {} 
+    pipelines_norm = {} # Dictionnaire {AM: [liste_noms_normalisés]}
     
     am_files = {'NAJWA': 'NAJWA.csv', 'HOUDA': 'HOUDA.csv', 'CHAIMA': 'CHAIMA.csv'}
     
     for am, filename in am_files.items():
         if os.path.exists(filename):
             try:
-                # Lecture flexible
-                df_p = pd.read_csv(filename, sep=None, engine='python')
+                # Lecture flexible (virgule ou point-virgule)
+                try:
+                    df_p = pd.read_csv(filename, sep=',')
+                    if len(df_p.columns) < 2: raise ValueError
+                except:
+                    df_p = pd.read_csv(filename, sep=';')
                 
-                # Trouver la colonne qui contient le nom (souvent la 1ère ou 'Name'/'Restaurant')
+                # Trouver la colonne qui contient le nom
                 df_p.columns = df_p.columns.str.strip().str.lower()
+                # On cherche une colonne qui contient 'restaurant' ou 'name', sinon la 1ère
                 col_name = next((c for c in df_p.columns if 'restaurant' in c or 'name' in c), df_p.columns[0])
                 
-                # Liste brute
+                # Création de la liste normalisée
                 raw_list = df_p[col_name].dropna().astype(str).tolist()
-                pipelines[am] = raw_list
-                
-                # Liste normalisée pour la comparaison
                 pipelines_norm[am] = [normalize_text(x) for x in raw_list]
                 
-            except:
-                pipelines[am] = []
+            except Exception:
                 pipelines_norm[am] = []
         else:
-            pipelines[am] = []
             pipelines_norm[am] = []
             
-    return pipelines, pipelines_norm
+    return pipelines_norm
 
+# ---------------------------------------------------------
+# CHARGEMENT ET TRAITEMENT DES DONNÉES COMMANDES
+# ---------------------------------------------------------
 @st.cache_data
 def load_data(main_file, pipelines_norm):
-    # 1. Lecture du fichier principal
+    # 1. Lecture Robuste
     if hasattr(main_file, 'seek'): main_file.seek(0)
     try:
         df = pd.read_csv(main_file, sep=',')
+        # Vérif si mal lu
         if 'order day' not in df.columns and len(df.columns) < 5: raise ValueError
     except:
         if hasattr(main_file, 'seek'): main_file.seek(0)
@@ -85,12 +86,12 @@ def load_data(main_file, pipelines_norm):
 
     df.columns = df.columns.str.strip()
     
-    # 2. Parsing Dates Robuste
+    # 2. Parsing Dates
     df['order day'] = df['order day'].astype(str)
     df['order time'] = df['order time'].astype(str)
     
     def parse_dt(d_str):
-        # Essayer les formats courants
+        # Tente plusieurs formats
         for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d'):
             try: return pd.to_datetime(d_str, format=fmt)
             except: continue
@@ -104,57 +105,54 @@ def load_data(main_file, pipelines_norm):
     df['date'] = df['order_datetime'].dt.date
     # Pour le tri mensuel
     df['year_month'] = df['order_datetime'].dt.to_period('M')
-    df['month_str'] = df['order_datetime'].dt.strftime('%Y-%m')
-
+    
     # 3. Nettoyage Numérique
     for c in ['item total', 'delivery amount', 'Distance travel']:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
-    # 4. Création de la colonne Restaurant Normalisée (pour les joins)
+    # 4. Normalisation du nom du restaurant (Clé de jointure)
     df['restaurant_norm'] = df['restaurant name'].apply(normalize_text)
 
-    # 5. Attribution AM (Priorité Pipeline Normalisé > Logique Auto)
+    # 5. Attribution AM (Logique : Pipeline > Grand Compte > Ville > Défaut)
     def get_am(row):
         r_norm = row['restaurant_norm']
-        
-        # Check dans les pipelines chargés (match exact ou partiel sur version normalisée)
-        for am, resto_list_norm in pipelines_norm.items():
-            # On cherche si le nom normalisé de la commande est DANS la liste normalisée pipeline
-            # Ou si une partie match (ex: "mcdonalds maarif" contient "mcdonalds")
-            if r_norm in resto_list_norm:
-                return am
-            # Match partiel (plus lent mais utile)
-            for p_norm in resto_list_norm:
-                if p_norm in r_norm or r_norm in p_norm:
-                    if len(p_norm) > 3: # Eviter les faux positifs courts
-                        return am
-        
-        # Fallback Logique (si pas dans les fichiers CSV)
         city = str(row.get('city', '')).lower()
         r_raw = str(row.get('restaurant name', '')).lower()
-        
-        if any(x in r_raw for x in ['mcdonald', 'kfc', 'burger king', 'primos', 'papa john']): return 'NAJWA'
+
+        # A. Check Pipeline (Match Exact ou Partiel Normalisé)
+        for am, resto_list_norm in pipelines_norm.items():
+            # Test 1: Le nom de la commande est dans la liste pipeline
+            if r_norm in resto_list_norm:
+                return am
+            # Test 2: Inclusions (ex: "mcdo maarif" contient "mcdo")
+            # Attention aux faux positifs courts, on filtre len > 3
+            for p_norm in resto_list_norm:
+                if len(p_norm) > 3 and (p_norm in r_norm):
+                    return am
+
+        # B. Fallback Logique "Hardcodée"
+        if any(x in r_raw for x in ['mcdonald', 'kfc', 'burger king', 'primos', 'papa john', 'quick']): return 'NAJWA'
         if any(c in city for c in ['rabat', 'sale', 'temara', 'kenitra']): return 'HOUDA'
         return 'CHAIMA'
 
     df['AM'] = df.apply(get_am, axis=1)
 
-    # 6. Autres Champs
+    # 6. Automatisation
     if 'Assigned By' in df.columns:
         df['is_automated'] = df['Assigned By'].astype(str).str.contains('Algorithm|super_app', case=False, regex=True)
     else:
         df['is_automated'] = False
         
-    # Groupement Enseigne
+    # 7. Groupement Enseigne
     def get_brand(name):
         n = normalize_text(name)
         if 'mcdonald' in n: return "McDonald's"
         if 'kfc' in n: return "KFC"
         if 'burger king' in n: return "Burger King"
         if 'chrono pizza' in n: return "Chrono Pizza"
+        if 'sushi' in n or 'asia' in n: return "Asian/Sushi"
         if 'tacos' in n: return "Tacos"
-        if 'sushi' in n or 'asia' in n: return "Asian"
         return "Autres"
     
     df['Enseigne_Groupe'] = df['restaurant name'].apply(get_brand)
@@ -162,23 +160,25 @@ def load_data(main_file, pipelines_norm):
     return df
 
 # ---------------------------------------------------------
-# INTERFACE & KPI
+# INTERFACE PRINCIPALE
 # ---------------------------------------------------------
 st.title("🚀 DASH-SBN | Monitoring & Pipeline")
 
-# CHARGEMENT
-pipelines, pipelines_norm = load_pipelines()
+# Chargement des Pipelines au démarrage
+pipelines_norm = load_pipelines()
 
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("Sources")
-    uploaded_file = st.file_uploader("Fichier Commandes (Export Admin)", type=['csv'])
+    st.header("📂 Sources")
+    uploaded_file = st.file_uploader("Fichier Commandes (CSV)", type=['csv'])
     
-    # Fallback Local (pour test facile)
-    default_csv = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
-    if not uploaded_file and os.path.exists(default_csv):
-       # Optionnel : charger automatiquement le fichier local s'il existe
-       # uploaded_file = default_csv
-       pass
+    # Fallback pour démo locale (Optionnel)
+    if not uploaded_file:
+        local_path = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
+        if os.path.exists(local_path):
+            # On ne charge pas auto pour laisser l'utilisateur upload, 
+            # sauf si vous voulez forcer le mode démo.
+            pass
 
     if uploaded_file:
         df = load_data(uploaded_file, pipelines_norm)
@@ -187,88 +187,83 @@ with st.sidebar:
         st.stop()
         
     st.divider()
-    st.header("Filtres")
+    st.header("🔍 Filtres")
     
-    # Select Période
+    # Sélecteur de Période
     if not df.empty:
         min_d, max_d = df['date'].min(), df['date'].max()
         date_range = st.date_input("Période Analysée", [min_d, max_d])
     else:
         st.stop()
     
-    # Select Enseigne
+    # Sélecteur Enseigne
     all_brands = ['Tous'] + sorted(df['Enseigne_Groupe'].unique().tolist())
-    sel_brand = st.selectbox("Enseigne", all_brands)
+    sel_brand = st.selectbox("Enseigne / Groupe", all_brands)
 
-# FILTRAGE DONNÉES
+# --- FILTRAGE PRINCIPAL ---
 mask = (df['date'] >= date_range[0]) & (df['date'] <= date_range[1])
 if sel_brand != 'Tous': mask &= (df['Enseigne_Groupe'] == sel_brand)
 df_filtered = df.loc[mask]
 
 if df_filtered.empty:
-    st.warning("Aucune donnée pour cette sélection.")
+    st.warning("⚠️ Aucune donnée pour cette sélection. Essayez d'élargir la période.")
     st.stop()
 
 # ---------------------------------------------------------
-# 1. TABLEAU KPI SYNTHÉTIQUE (PAR AM)
+# 1. TABLEAU DE BORD KPI (AM)
 # ---------------------------------------------------------
 st.subheader("📊 Performance par Account Manager (AM)")
+
+# On prépare la comparaison temporelle pour le "Growth" global du tableau
+# Période précédente = même durée juste avant la date de début
+delta_days = (date_range[1] - date_range[0]).days + 1
+prev_start = date_range[0] - timedelta(days=delta_days)
+prev_end = date_range[0] - timedelta(days=1)
+# Dataset global pour aller chercher l'historique hors filtre date actuel
+df_prev_period = df[(df['date'] >= prev_start) & (df['date'] <= prev_end)]
 
 summary_data = []
 ams_list = ['NAJWA', 'HOUDA', 'CHAIMA']
 
-# Calcul de la période précédente (pour le Growth du tableau principal)
-delta_days = (date_range[1] - date_range[0]).days + 1
-prev_start = date_range[0] - timedelta(days=delta_days)
-prev_end = date_range[0] - timedelta(days=1)
-mask_prev_period = (df['date'] >= prev_start) & (df['date'] <= prev_end)
-df_prev_period = df.loc[mask_prev_period]
-
 for am in ams_list:
-    # Données filtrées pour cet AM (Période Actuelle)
+    # Données actuelles
     data_am = df_filtered[df_filtered['AM'] == am]
     
-    # 1. Metrics Base
+    # Metrics
     ca = data_am['item total'].sum()
     orders = len(data_am)
     aov = ca / orders if orders > 0 else 0
     
-    # 2. Automatisation
-    auto_cnt = data_am['is_automated'].sum()
-    auto_rate = (auto_cnt / orders * 100) if orders > 0 else 0
-    
-    # 3. Taux d'Acceptation
+    # Taux
+    auto_rate = (data_am['is_automated'].sum() / orders * 100) if orders > 0 else 0
     rejects = data_am[data_am['status'] == 'Restaurant Rejected'].shape[0]
     acc_rate = ((orders - rejects) / orders * 100) if orders > 0 else 100
     
-    # 4. Inactifs (Matching Normalisé)
-    pipeline_names_norm = pipelines_norm.get(am, [])
-    total_pipeline = len(pipeline_names_norm)
+    # Inactifs (Comparaison Pipeline vs Actifs Normalisés)
+    pipeline = pipelines_norm.get(am, [])
+    total_pipeline = len(pipeline)
     
-    # Liste réelle normalisée
     active_norm = data_am['restaurant_norm'].unique().tolist()
     
     # Compter les inactifs
-    # On regarde combien de noms du pipeline ne sont PAS dans les actifs
-    actives_count_in_pipeline = 0
-    for p_norm in pipeline_names_norm:
-        # Match exact ou partiel
-        found = False
+    actives_in_pipeline = 0
+    for p_norm in pipeline:
+        # Est-ce que ce resto du pipeline a été actif ?
+        # On vérifie si p_norm est contenu dans un des noms actifs ou l'inverse
+        is_active = False
         if p_norm in active_norm:
-            found = True
+            is_active = True
         else:
-            # Essai partiel si pas de match exact
-            for a_norm in active_norm:
-                if p_norm in a_norm or a_norm in p_norm:
-                    found = True
+            # Recherche flexible
+            for a_n in active_norm:
+                if p_norm in a_n: 
+                    is_active = True
                     break
-        if found:
-            actives_count_in_pipeline += 1
+        if is_active: actives_in_pipeline += 1
             
-    inactifs = total_pipeline - actives_count_in_pipeline
-    inactifs = max(0, inactifs)
+    inactifs = max(0, total_pipeline - actives_in_pipeline)
     
-    # 5. Growth (Vs Période Précédente)
+    # Growth (vs Période Précédente)
     prev_ca = df_prev_period[df_prev_period['AM'] == am]['item total'].sum()
     growth = ((ca - prev_ca) / prev_ca * 100) if prev_ca > 0 else 0
 
@@ -285,6 +280,8 @@ for am in ams_list:
     })
 
 df_summary = pd.DataFrame(summary_data)
+
+# Affichage avec style
 st.dataframe(
     df_summary.style.format({
         "CA (MAD)": "{:,.0f}",
@@ -304,35 +301,33 @@ st.divider()
 # ---------------------------------------------------------
 # 2. ANALYSE MENSUELLE (MONTH OVER MONTH)
 # ---------------------------------------------------------
-st.subheader("📅 Évolution Mensuelle (Comparaison des Mois)")
+st.subheader("📅 Évolution Mensuelle (Historique)")
 
-# On groupe par Mois pour tout le dataset (pas seulement la sélection)
-# Mais on respecte le filtre Enseigne si appliqué
-mask_brand = (df['Enseigne_Groupe'] == sel_brand) if sel_brand != 'Tous' else [True] * len(df)
-df_monthly_base = df[mask_brand].copy()
+# On prend tout l'historique disponible qui correspond au filtre Enseigne
+mask_brand_hist = (df['Enseigne_Groupe'] == sel_brand) if sel_brand != 'Tous' else [True] * len(df)
+df_history = df[mask_brand_hist].copy()
 
-if not df_monthly_base.empty:
-    monthly_stats = df_monthly_base.groupby('year_month').agg({
+if not df_history.empty:
+    # Agrégation par Mois
+    monthly = df_history.groupby('year_month').agg({
         'item total': 'sum',
         'order id': 'count',
-        'is_automated': 'mean',
-        'AM': lambda x: x.mode()[0] if not x.mode().empty else 'Mix' # AM dominant
-    }).reset_index()
+        'is_automated': 'mean'
+    }).reset_index().sort_values('year_month')
     
-    monthly_stats = monthly_stats.sort_values('year_month')
-    monthly_stats['Mois'] = monthly_stats['year_month'].dt.strftime('%Y-%m')
+    monthly['Mois'] = monthly['year_month'].dt.strftime('%Y-%m')
     
-    # Calcul des variations (Shift)
-    monthly_stats['CA Précédent'] = monthly_stats['item total'].shift(1)
-    monthly_stats['Growth MoM (%)'] = ((monthly_stats['item total'] - monthly_stats['CA Précédent']) / monthly_stats['CA Précédent'] * 100).fillna(0)
+    # Calcul Variation MoM (Mois actuel vs Mois précédent)
+    monthly['CA Précédent'] = monthly['item total'].shift(1)
+    monthly['Growth MoM (%)'] = ((monthly['item total'] - monthly['CA Précédent']) / monthly['CA Précédent'] * 100).fillna(0)
     
-    # Mise en forme
-    monthly_display = monthly_stats[['Mois', 'item total', 'Growth MoM (%)', 'order id', 'is_automated']].copy()
-    monthly_display.columns = ['Mois', 'CA (MAD)', 'Croissance MoM (%)', 'Commandes', 'Auto (%)']
-    monthly_display['Auto (%)'] = (monthly_display['Auto (%)'] * 100)
+    # Mise en forme pour affichage
+    monthly_show = monthly[['Mois', 'item total', 'Growth MoM (%)', 'order id', 'is_automated']].copy()
+    monthly_show.columns = ['Mois', 'CA (MAD)', 'Croissance MoM (%)', 'Commandes', 'Auto (%)']
+    monthly_show['Auto (%)'] *= 100 # Passage en pourcentage
 
     st.dataframe(
-        monthly_display.style.format({
+        monthly_show.style.format({
             "CA (MAD)": "{:,.0f}",
             "Croissance MoM (%)": "{:+.1f}%",
             "Commandes": "{:.0f}",
@@ -342,33 +337,41 @@ if not df_monthly_base.empty:
         hide_index=True
     )
 else:
-    st.info("Pas assez de données historiques pour l'évolution mensuelle.")
+    st.info("Pas assez de données pour l'historique.")
 
 st.divider()
 
 # ---------------------------------------------------------
-# 3. ANALYSE DE RÉGRESSION (TOP FLOP)
+# 3. RÉGRESSION (TOP FLOP) - CORRIGÉ
 # ---------------------------------------------------------
-st.subheader("🚨 Top Régressions (Période vs Période Précédente)")
+st.subheader("🚨 Restaurants en Régression (Volume Commandes)")
 col_reg1, col_reg2 = st.columns([3, 1])
 
 with col_reg1:
-    # Comparaison Période Actuelle (df_filtered) vs Période Précédente (df_prev_period, avec filtre enseigne)
-    if sel_brand != 'Tous':
-        df_prev_period_brand = df_prev_period[df_prev_period['Enseigne_Groupe'] == sel_brand]
-    else:
-        df_prev_period_brand = df_prev_period
+    # 1. Map de référence {Resto -> AM} pour éviter les trous
+    # On prend le dernier AM connu pour chaque resto
+    resto_am_map = df.sort_values('date').drop_duplicates('restaurant name', keep='last').set_index('restaurant name')['AM'].to_dict()
 
-    curr_counts = df_filtered.groupby(['restaurant name', 'AM'])['order id'].count().reset_index().rename(columns={'order id': 'Orders Current'})
-    prev_counts = df_prev_period_brand.groupby('restaurant name')['order id'].count().reset_index().rename(columns={'order id': 'Orders Prev'})
+    # 2. Données Précédentes (filtrées par enseigne si besoin)
+    if sel_brand != 'Tous':
+        df_prev_filter = df_prev_period[df_prev_period['Enseigne_Groupe'] == sel_brand]
+    else:
+        df_prev_filter = df_prev_period
+
+    # 3. GroupBy
+    curr_counts = df_filtered.groupby('restaurant name')['order id'].count().reset_index().rename(columns={'order id': 'Orders Current'})
+    prev_counts = df_prev_filter.groupby('restaurant name')['order id'].count().reset_index().rename(columns={'order id': 'Orders Prev'})
     
+    # 4. Fusion
     reg_df = pd.merge(curr_counts, prev_counts, on='restaurant name', how='outer').fillna(0)
     
-    # Calcul Delta
+    # 5. Calcul Delta
     reg_df['Delta'] = reg_df['Orders Current'] - reg_df['Orders Prev']
-    # On récupère l'AM correct (car parfois absent de curr ou prev)
-    reg_df['AM'] = reg_df.apply(lambda x: x['AM_x'] if pd.notna(x['AM_x']) else df[df['restaurant name'] == x['restaurant name']]['AM'].iloc[0] if not df[df['restaurant name'] == x['restaurant name']].empty else "Unknown", axis=1)
     
+    # 6. Récupération AM sécurisée
+    reg_df['AM'] = reg_df['restaurant name'].map(resto_am_map).fillna('Autre')
+    
+    # 7. Filtre et Tri
     flop_df = reg_df[reg_df['Delta'] < 0].sort_values('Delta', ascending=True)
     
     if not flop_df.empty:
@@ -381,17 +384,18 @@ with col_reg1:
             use_container_width=True
         )
     else:
-        st.success("Aucun restaurant en régression sur cette période !")
+        st.success("Aucune régression détectée sur cette période !")
 
 with col_reg2:
-    st.markdown(f"**Comparatif :**")
-    st.caption(f"Actuel: {date_range[0]} au {date_range[1]}")
-    st.caption(f"Précédent: {prev_start} au {prev_end}")
+    st.markdown("**Comparaison :**")
+    st.caption(f"Actuel : {date_range[0]} au {date_range[1]}")
+    st.caption(f"Précédent : {prev_start} au {prev_end}")
     if not flop_df.empty:
-        st.error(f"Perte Totale: {flop_df['Delta'].sum():.0f} cmds")
+        perte = flop_df['Delta'].sum()
+        st.error(f"Perte Totale : {perte:.0f} commandes")
 
 # ---------------------------------------------------------
-# 4. DONNÉES DÉTAILLÉES
+# 4. DATA DETAIL
 # ---------------------------------------------------------
-with st.expander("Voir le détail des commandes brutes"):
+with st.expander("Voir les données brutes"):
     st.dataframe(df_filtered)
