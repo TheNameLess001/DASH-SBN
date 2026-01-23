@@ -7,10 +7,10 @@ from datetime import timedelta
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-st.set_page_config(page_title="DASH-SBN | Analytics", page_icon="📉", layout="wide")
+st.set_page_config(page_title="DASH-SBN | Analytics", page_icon="📊", layout="wide")
 
 # ---------------------------------------------------------
-# UTILITAIRES
+# UTILITAIRES & CHARGEMENT
 # ---------------------------------------------------------
 def normalize_text(text):
     if pd.isna(text): return ""
@@ -19,9 +19,6 @@ def normalize_text(text):
     ascii_text = "".join([c for c in nfkd if not unicodedata.combining(c)])
     return ascii_text.lower().strip()
 
-# ---------------------------------------------------------
-# CHARGEMENT
-# ---------------------------------------------------------
 @st.cache_data
 def load_pipelines():
     pipelines_norm = {}
@@ -112,157 +109,214 @@ def load_data(main_file, pipelines_norm):
     return df
 
 # ---------------------------------------------------------
-# APP
+# INTERFACE PRINCIPALE
 # ---------------------------------------------------------
-st.title("🚀 DASH-SBN | Monitoring")
+st.title("🚀 DASH-SBN | Performance Analytics")
 pipelines_norm = load_pipelines()
 
 with st.sidebar:
-    st.header("📂 Data")
+    st.header("📂 Données")
     uploaded_file = st.file_uploader("Fichier CSV", type=['csv'])
     
-    # Auto-load local pour faciliter les tests
+    # Auto-load local (Optionnel)
     if not uploaded_file:
         local = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
-        # Si vous voulez tester en local sans upload, décommentez la ligne suivante
         # if os.path.exists(local): uploaded_file = local 
         pass
 
     if uploaded_file:
         df = load_data(uploaded_file, pipelines_norm)
     else:
-        st.info("Chargez le fichier.")
+        st.info("Chargez le fichier CSV.")
         st.stop()
         
     st.divider()
-    st.header("🔍 Filtres")
+    st.header("🎯 Scope & Filtres")
     
-    # --- INTELLIGENCE DATE ---
-    last_date = df['date'].max()
-    first_date_of_month = last_date.replace(day=1)
+    # 1. SCOPE (GLOBAL OU AM)
+    scope_options = ['Global', 'NAJWA', 'HOUDA', 'CHAIMA']
+    selected_scope = st.selectbox("Vue (Scope)", scope_options)
     
-    date_range = st.date_input("Période", [first_date_of_month, last_date])
+    # 2. FILTRE ENSEIGNE
+    # On filtre les options d'enseigne selon le scope choisi pour éviter le bruit
+    if selected_scope != 'Global':
+        df_scope_preview = df[df['AM'] == selected_scope]
+        available_brands = ['Tous'] + sorted(df_scope_preview['Enseigne_Groupe'].unique().tolist())
+    else:
+        available_brands = ['Tous'] + sorted(df['Enseigne_Groupe'].unique().tolist())
+        
+    sel_brand = st.selectbox("Enseigne / Groupe", available_brands)
     
-    all_brands = ['Tous'] + sorted(df['Enseigne_Groupe'].unique().tolist())
-    sel_brand = st.selectbox("Enseigne", all_brands)
+    # 3. DATE
+    # On prend tout par défaut pour le tableau mensuel, mais on garde le datepicker pour l'analyse fine
+    min_d, max_d = df['date'].min(), df['date'].max()
+    st.caption(f"Données disponibles du {min_d} au {max_d}")
 
-# FILTRE
-mask = (df['date'] >= date_range[0]) & (df['date'] <= date_range[1])
-if sel_brand != 'Tous': mask &= (df['Enseigne_Groupe'] == sel_brand)
-df_filtered = df.loc[mask]
+# ---------------------------------------------------------
+# PRÉPARATION DES DONNÉES FILTRÉES
+# ---------------------------------------------------------
 
-if df_filtered.empty:
-    st.warning("Aucune donnée sur cette période.")
+# Filtre Scope (AM)
+if selected_scope == 'Global':
+    df_scope = df.copy()
+    # Pipeline Global = Union de tous les pipelines
+    current_pipeline = []
+    for p_list in pipelines_norm.values():
+        current_pipeline.extend(p_list)
+    current_pipeline = list(set(current_pipeline)) # Unique
+else:
+    df_scope = df[df['AM'] == selected_scope]
+    current_pipeline = pipelines_norm.get(selected_scope, [])
+
+# Filtre Enseigne
+if sel_brand != 'Tous':
+    df_scope = df_scope[df_scope['Enseigne_Groupe'] == sel_brand]
+
+if df_scope.empty:
+    st.warning("Aucune donnée pour ce scope.")
     st.stop()
 
 # ---------------------------------------------------------
-# 1. KPI GLOBAL (AM)
+# 1. TABLEAU KPI MENSUEL (L'élément central demandé)
 # ---------------------------------------------------------
-st.subheader("📊 Performance par AM")
-# Comparaison Période (Même durée avant)
-delta_days = (date_range[1] - date_range[0]).days + 1
-prev_start = date_range[0] - timedelta(days=delta_days)
-prev_end = date_range[0] - timedelta(days=1)
-df_prev = df[(df['date'] >= prev_start) & (df['date'] <= prev_end)]
+st.subheader(f"📊 Performance Mensuelle : {selected_scope}")
 
-summary = []
-for am in ['NAJWA', 'HOUDA', 'CHAIMA']:
-    d_am = df_filtered[df_filtered['AM']==am]
-    rev = d_am['item total'].sum()
-    orders = len(d_am)
+# Agrégation par mois
+monthly_stats = df_scope.groupby('year_month').agg({
+    'item total': 'sum',
+    'order id': 'count',
+    'is_automated': 'sum',
+    'status': lambda x: (x == 'Restaurant Rejected').sum() # Compte les rejets
+}).reset_index().sort_values('year_month')
+
+monthly_stats['Mois'] = monthly_stats['year_month'].dt.strftime('%Y-%m')
+
+# Calculs Metrics
+monthly_stats['AOV'] = monthly_stats['item total'] / monthly_stats['order id']
+monthly_stats['Auto %'] = (monthly_stats['is_automated'] / monthly_stats['order id'] * 100)
+monthly_stats['Accept %'] = ((monthly_stats['order id'] - monthly_stats['status']) / monthly_stats['order id'] * 100) # status contient le nb de rejects ici
+
+# Calcul Growth (MoM)
+monthly_stats['CA Prev'] = monthly_stats['item total'].shift(1)
+monthly_stats['Growth %'] = ((monthly_stats['item total'] - monthly_stats['CA Prev']) / monthly_stats['CA Prev'] * 100).fillna(0)
+
+# Calcul Inactifs Mensuels
+# Pour chaque mois, on regarde quels restaurants du pipeline N'ONT PAS commandé
+inactifs_list = []
+total_pipeline_len = len(current_pipeline)
+
+for ym in monthly_stats['year_month']:
+    # Restos actifs ce mois-ci
+    actifs_this_month = df_scope[df_scope['year_month'] == ym]['restaurant_norm'].unique().tolist()
     
-    # Growth
-    rev_prev = df_prev[df_prev['AM']==am]['item total'].sum()
-    growth = ((rev - rev_prev)/rev_prev*100) if rev_prev > 0 else 0
-    
-    # Inactifs
-    pipe = pipelines_norm.get(am, [])
-    active = d_am['restaurant_norm'].unique().tolist()
-    # Logique Inactifs
-    matched = 0
-    for p in pipe:
-        if any(p in a for a in active): matched += 1
-    inact = max(0, len(pipe) - matched)
+    # Combien du pipeline sont dedans ?
+    found_count = 0
+    if total_pipeline_len > 0:
+        for p in current_pipeline:
+            # Match flexible
+            if any(p in a for a in actifs_this_month):
+                found_count += 1
+        
+        nb_inactifs = max(0, total_pipeline_len - found_count)
+    else:
+        nb_inactifs = 0
+    inactifs_list.append(nb_inactifs)
 
-    summary.append({
-        "AM": am, "CA": rev, "Commandes": orders, "Growth %": growth, 
-        "Pipeline": len(pipe), "Inactifs": inact
-    })
+monthly_stats['Inactifs'] = inactifs_list
+monthly_stats['Pipeline'] = total_pipeline_len
 
-# Ici on utilise un dictionnaire de formatage, donc pas de problème pour les colonnes texte
-st.dataframe(pd.DataFrame(summary).style.format({"CA":"{:,.0f}","Growth %":"{:+.1f}%"}).background_gradient(subset=['Growth %'], cmap="Greens"), use_container_width=True)
+# Mise en forme Tableau
+display_cols = ['Mois', 'item total', 'order id', 'AOV', 'Growth %', 'Auto %', 'Accept %', 'Inactifs']
+rename_map = {
+    'item total': 'CA (MAD)', 
+    'order id': 'Commandes', 
+    'AOV': 'Panier Moy.',
+    'Accept %': 'Taux Accept.'
+}
+
+final_table = monthly_stats[display_cols].rename(columns=rename_map)
+
+st.dataframe(
+    final_table.style.format({
+        "CA (MAD)": "{:,.0f}",
+        "Commandes": "{:.0f}",
+        "Panier Moy.": "{:.1f}",
+        "Growth %": "{:+.1f}%",
+        "Auto %": "{:.1f}%",
+        "Taux Accept.": "{:.1f}%",
+        "Inactifs": "{:.0f}"
+    }).background_gradient(subset=['Growth %'], cmap="RdYlGn", vmin=-20, vmax=20),
+    use_container_width=True,
+    hide_index=True
+)
 
 st.divider()
 
 # ---------------------------------------------------------
-# 2. FLOP AUTOMATIQUE (MOIS M vs MOIS M-1)
+# 2. TOP FLOP & PROGRESSION (Automatique Derniers Mois)
 # ---------------------------------------------------------
-st.subheader("📉 Top Flops (Comparaison Automatique Derniers Mois)")
+st.subheader("📈 Tops & 📉 Flops (Comparaison Automatique)")
 
 all_months = sorted(df['year_month'].unique())
 if len(all_months) >= 2:
-    last_month = all_months[-1]
-    prev_month = all_months[-2]
+    last_month = all_months[-1] # Ex: Jan
+    prev_month = all_months[-2] # Ex: Dec
     
-    col_info, col_table = st.columns([1, 3])
-    with col_info:
-        st.info(f"Comparaison de **{last_month}** par rapport à **{prev_month}**")
+    st.info(f"Comparaison : **{last_month}** vs **{prev_month}**")
+    
+    # Préparation des données pour la comparaison
+    # On utilise df_scope (déjà filtré par Scope et Enseigne)
+    df_m = df_scope[df_scope['year_month'] == last_month]
+    df_m_1 = df_scope[df_scope['year_month'] == prev_month]
+    
+    stats_m = df_m.groupby('restaurant name')['order id'].count()
+    stats_m_1 = df_m_1.groupby('restaurant name')['order id'].count()
+    
+    comp_df = pd.DataFrame({'Mois Préc': stats_m_1, 'Mois Actuel': stats_m}).fillna(0)
+    comp_df['Delta'] = comp_df['Mois Actuel'] - comp_df['Mois Préc']
+    
+    # On ajoute la colonne AM pour info
+    map_am = df.drop_duplicates('restaurant name').set_index('restaurant name')['AM'].to_dict()
+    comp_df['AM'] = comp_df.index.map(map_am)
 
-    with col_table:
-        df_m = df[df['year_month'] == last_month]
-        df_m_1 = df[df['year_month'] == prev_month]
+    # COLONNES
+    col_flop, col_top = st.columns(2)
+    
+    # --- FLOP (Régression) ---
+    with col_flop:
+        st.markdown("### 🚨 Top Régressions")
+        flops = comp_df[comp_df['Delta'] < 0].sort_values('Delta', ascending=True).head(10)
         
-        if sel_brand != 'Tous':
-            df_m = df_m[df_m['Enseigne_Groupe'] == sel_brand]
-            df_m_1 = df_m_1[df_m_1['Enseigne_Groupe'] == sel_brand]
-
-        stats_m = df_m.groupby('restaurant name')['order id'].count()
-        stats_m_1 = df_m_1.groupby('restaurant name')['order id'].count()
-        
-        flop_auto = pd.DataFrame({'Mois Préc': stats_m_1, 'Mois Actuel': stats_m}).fillna(0)
-        flop_auto['Perte'] = flop_auto['Mois Actuel'] - flop_auto['Mois Préc']
-        
-        map_am = df.drop_duplicates('restaurant name').set_index('restaurant name')['AM'].to_dict()
-        flop_auto['AM'] = flop_auto.index.map(map_am)
-        
-        vrais_flops = flop_auto[flop_auto['Perte'] < 0].sort_values('Perte')
-        
-        if not vrais_flops.empty:
-            # CORRECTION ICI : Formatage spécifique par colonne
+        if not flops.empty:
             st.dataframe(
-                vrais_flops[['AM', 'Mois Préc', 'Mois Actuel', 'Perte']].style.format(
-                    {'Mois Préc': "{:.0f}", 'Mois Actuel': "{:.0f}", 'Perte': "{:.0f}"}
-                ).background_gradient(subset=['Perte'], cmap='Reds_r'),
+                flops[['AM', 'Mois Préc', 'Mois Actuel', 'Delta']].style.format(
+                    {'Mois Préc': "{:.0f}", 'Mois Actuel': "{:.0f}", 'Delta': "{:.0f}"}
+                ).background_gradient(subset=['Delta'], cmap='Reds_r'),
                 use_container_width=True
             )
         else:
-            st.success("Aucune régression entre ces deux mois.")
+            st.success("Aucune baisse significative.")
+
+    # --- TOP (Progression) ---
+    with col_top:
+        st.markdown("### 🚀 Top Progressions")
+        tops = comp_df[comp_df['Delta'] > 0].sort_values('Delta', ascending=False).head(10)
+        
+        if not tops.empty:
+            st.dataframe(
+                tops[['AM', 'Mois Préc', 'Mois Actuel', 'Delta']].style.format(
+                    {'Mois Préc': "{:.0f}", 'Mois Actuel': "{:.0f}", 'Delta': "{:+.0f}"}
+                ).background_gradient(subset=['Delta'], cmap='Greens'),
+                use_container_width=True
+            )
+        else:
+            st.info("Aucune hausse significative.")
+            
 else:
-    st.warning("Pas assez d'historique.")
+    st.warning("Pas assez d'historique (besoin de 2 mois min) pour calculer les Tops/Flops.")
 
 # ---------------------------------------------------------
-# 3. RÉGRESSION PERSONNALISÉE
+# 3. DONNÉES BRUTES
 # ---------------------------------------------------------
-st.divider()
-st.subheader(f"🔍 Régression sur la période sélectionnée")
-
-curr = df_filtered.groupby('restaurant name')['order id'].count()
-if sel_brand != 'Tous': df_prev = df_prev[df_prev['Enseigne_Groupe'] == sel_brand]
-prev = df_prev.groupby('restaurant name')['order id'].count()
-
-reg_custom = pd.DataFrame({'Avant': prev, 'Pendant': curr}).fillna(0)
-reg_custom['Delta'] = reg_custom['Pendant'] - reg_custom['Avant']
-reg_custom['AM'] = reg_custom.index.map(map_am)
-
-flops_custom = reg_custom[reg_custom['Delta'] < 0].sort_values('Delta')
-
-if not flops_custom.empty:
-    # CORRECTION ICI : Formatage spécifique par colonne
-    st.dataframe(
-        flops_custom[['AM', 'Avant', 'Pendant', 'Delta']].style.format(
-            {'Avant': "{:.0f}", 'Pendant': "{:.0f}", 'Delta': "{:.0f}"}
-        ).background_gradient(subset=['Delta'], cmap='Reds_r'),
-        use_container_width=True
-    )
-else:
-    st.info("Aucune régression sur cette plage de dates spécifique.")
+with st.expander("Voir les données brutes"):
+    st.dataframe(df_scope)
