@@ -32,7 +32,6 @@ def load_pipeline_excel(uploaded_file):
     
     try:
         # sheet_name=None permet de lire TOUTES les feuilles dans un dictionnaire
-        # keys = noms des feuilles (AM), values = dataframes
         xls = pd.read_excel(uploaded_file, sheet_name=None)
         
         all_data = []
@@ -65,6 +64,31 @@ def load_orders_csv(uploaded_file):
         except Exception as e:
             st.error(f"❌ Erreur lecture Admin Earnings : {e}")
     return None
+
+def get_monthly_evolution_table(df):
+    """Génère un tableau récapitulatif par mois."""
+    if df.empty:
+        return pd.DataFrame()
+        
+    df_monthly = df.groupby(df['order day'].dt.to_period('M').astype(str)).agg({
+        'GMV': 'sum',
+        'order id': 'count',
+        'is_cancelled': 'mean',
+        'Delivery Time': 'mean'
+    }).reset_index().rename(columns={'order day': 'Mois'})
+    
+    # Calculs KPIs dérivés
+    df_monthly['Taux Annulation %'] = (df_monthly['is_cancelled'] * 100).round(2)
+    df_monthly['AOV (Panier Moyen)'] = (df_monthly['GMV'] / df_monthly['order id']).round(0)
+    df_monthly['Temps Livraison (min)'] = df_monthly['Delivery Time'].round(1)
+    df_monthly['GMV'] = df_monthly['GMV'].round(0)
+    
+    # Mise en forme et tri
+    df_monthly = df_monthly.sort_values('Mois', ascending=False) # Le plus récent en haut
+    
+    # Sélection colonnes finales
+    final_cols = ['Mois', 'GMV', 'order id', 'AOV (Panier Moyen)', 'Taux Annulation %', 'Temps Livraison (min)']
+    return df_monthly[final_cols].rename(columns={'order id': 'Volume Commandes', 'GMV': 'Chiffre d\'Affaires (DH)'})
 
 # --- APPLICATION PRINCIPALE ---
 
@@ -186,11 +210,10 @@ if orders_file is not None and pipeline_file is not None:
             # --- GRAPHIQUES ÉVOLUTION (Growth) ---
             st.subheader(f"📈 Croissance & Tendance - {selected_am}")
             
-            # Agrégation par mois
+            # Données mensuelles pour les graphs
             df_growth = df_view.groupby(df_view['order day'].dt.to_period('M').astype(str)).agg({
                 'GMV': 'sum',
-                'order id': 'count',
-                'is_cancelled': 'mean'
+                'order id': 'count'
             }).reset_index().rename(columns={'order day': 'Mois'})
             
             c1, c2 = st.columns(2)
@@ -202,6 +225,15 @@ if orders_file is not None and pipeline_file is not None:
                 fig_orders = px.line(df_growth, x='Mois', y='order id', title="Évolution Volume Commandes", markers=True, color_discrete_sequence=['#ff00ff'])
                 fig_orders.update_layout(xaxis_title=None)
                 st.plotly_chart(fig_orders, use_container_width=True)
+
+            # --- TABLEAU ÉVOLUTION PAR MOIS (NOUVEAU) ---
+            st.subheader("📅 Détail Évolution Mensuelle (KPIs)")
+            with st.expander("Voir le tableau d'évolution complet", expanded=True):
+                df_evo_am = get_monthly_evolution_table(df_view)
+                st.dataframe(
+                    df_evo_am.style.background_gradient(cmap="Purples", subset=['Chiffre d\'Affaires (DH)', 'Volume Commandes']),
+                    use_container_width=True
+                )
 
             st.divider()
 
@@ -233,9 +265,6 @@ if orders_file is not None and pipeline_file is not None:
             }
             tech_col = col_map[sort_col]
             
-            # Sens du tri (Annulation & Temps = Plus petit est mieux, donc Ascendant pour TOP)
-            # MAIS pour le tableau "TOP", on veut afficher les "Meilleurs chiffres".
-            # Pour GMV : Descendant. Pour Annulation : Ascendant (le plus bas).
             if tech_col in ["Taux Annulation %", "Delivery Time"]:
                 ascending_top = True
             else:
@@ -262,7 +291,7 @@ if orders_file is not None and pipeline_file is not None:
                 )
 
             # --- DÉTAILS AVEC FILTRES ---
-            with st.expander("📋 Voir les détails complets (Filtrables)"):
+            with st.expander("📋 Voir les détails complets par Restaurant (Filtrables)"):
                 selected_restos = st.multiselect("Filtrer par Restaurant :", sorted(df_rank['Restaurant_Final'].unique()))
                 if selected_restos:
                     st.dataframe(df_rank[df_rank['Restaurant_Final'].isin(selected_restos)], use_container_width=True)
@@ -284,6 +313,17 @@ if orders_file is not None and pipeline_file is not None:
             k1.metric("GMV Total", f"{tot_gmv:,.0f} DH")
             k2.metric("Volume Commandes", f"{tot_ord:,.0f}")
             k3.metric("Taux Annulation Global", f"{tot_cancel:.2f}%")
+            
+            st.divider()
+
+            # --- TABLEAU ÉVOLUTION PAR MOIS (NOUVEAU) ---
+            st.subheader("📅 Détail Évolution Mensuelle Global (KPIs)")
+            with st.expander("Voir le tableau d'évolution complet", expanded=True):
+                df_evo_global = get_monthly_evolution_table(df_filtered)
+                st.dataframe(
+                    df_evo_global.style.background_gradient(cmap="Purples", subset=['Chiffre d\'Affaires (DH)', 'Volume Commandes']),
+                    use_container_width=True
+                )
             
             st.divider()
             
