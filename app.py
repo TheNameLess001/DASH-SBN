@@ -1,331 +1,273 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import glob
 import os
-import unicodedata
-from datetime import timedelta
 
-# ---------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------
-st.set_page_config(page_title="DASH-SBN | Analytics", page_icon="📊", layout="wide")
+# --- CONFIGURATION DE LA PAGE ---
+st.set_page_config(
+    page_title="Yassir Restaurant Dashboard",
+    page_icon="🟣",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ---------------------------------------------------------
-# UTILITAIRES & CHARGEMENT
-# ---------------------------------------------------------
-def normalize_text(text):
-    if pd.isna(text): return ""
-    text = str(text)
-    nfkd = unicodedata.normalize('NFKD', text)
-    ascii_text = "".join([c for c in nfkd if not unicodedata.combining(c)])
-    return ascii_text.lower().strip()
+# --- THÈME YASSIR (CSS CUSTOM) ---
+st.markdown("""
+    <style>
+    /* Couleur principale Violet Yassir */
+    :root {
+        --primary-color: #6c35de;
+    }
+    .stButton>button {
+        background-color: #6c35de;
+        color: white;
+    }
+    .stMetric {
+        background-color: #f3f0ff;
+        padding: 15px;
+        border-radius: 10px;
+        border-left: 5px solid #6c35de;
+    }
+    h1, h2, h3 {
+        color: #4b2c92;
+    }
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
+        font-size: 1.2rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
+# --- FONCTIONS DE CHARGEMENT DES DONNÉES ---
 @st.cache_data
-def load_pipelines():
-    pipelines_norm = {}
-    am_files = {'NAJWA': 'NAJWA.csv', 'HOUDA': 'HOUDA.csv', 'CHAIMA': 'CHAIMA.csv'}
-    for am, filename in am_files.items():
-        if os.path.exists(filename):
-            try:
-                try:
-                    df = pd.read_csv(filename, sep=',')
-                    if len(df.columns)<2: raise ValueError
-                except:
-                    df = pd.read_csv(filename, sep=';')
-                
-                df.columns = df.columns.str.strip().str.lower()
-                col = next((c for c in df.columns if 'restaurant' in c or 'name' in c), df.columns[0])
-                pipelines_norm[am] = [normalize_text(x) for x in df[col].dropna().astype(str).tolist()]
-            except: pipelines_norm[am] = []
-        else: pipelines_norm[am] = []
-    return pipelines_norm
-
-@st.cache_data
-def load_data(main_file, pipelines_norm):
-    if hasattr(main_file, 'seek'): main_file.seek(0)
-    try:
-        df = pd.read_csv(main_file, sep=',')
-        if 'order day' not in df.columns and len(df.columns) < 5: raise ValueError
-    except:
-        if hasattr(main_file, 'seek'): main_file.seek(0)
-        df = pd.read_csv(main_file, sep=';')
-
-    df.columns = df.columns.str.strip()
+def load_data():
+    # 1. Chargement des fichiers Pipeline (concaténation de tous les fichiers pipeline)
+    pipeline_files = glob.glob("pipline AM.xlsx - *.csv")
+    df_pipeline_list = []
     
-    # Dates
-    df['order day'] = df['order day'].astype(str)
-    df['order time'] = df['order time'].astype(str)
-    
-    def parse_dt(d_str):
-        for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d'):
-            try: return pd.to_datetime(d_str, format=fmt)
-            except: continue
-        return pd.to_datetime(d_str, errors='coerce')
-
-    df['order_date_obj'] = df['order day'].apply(parse_dt)
-    df['order_datetime'] = pd.to_datetime(
-        df['order_date_obj'].dt.strftime('%Y-%m-%d') + ' ' + df['order time'], errors='coerce'
-    )
-    df['date'] = df['order_datetime'].dt.date
-    df['year_month'] = df['order_datetime'].dt.to_period('M')
-
-    # Numérique
-    for c in ['item total', 'delivery amount', 'delivery time(M)', 'Time Taken']:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-
-    # Attribution AM
-    df['restaurant_norm'] = df['restaurant name'].apply(normalize_text)
-    
-    def get_am(row):
-        r_norm = row['restaurant_norm']
-        city = str(row.get('city', '')).lower()
-        r_raw = str(row.get('restaurant name', '')).lower()
-        
-        for am, p_list in pipelines_norm.items():
-            if r_norm in p_list: return am
-            for p in p_list:
-                if len(p)>3 and p in r_norm: return am
-        
-        if any(x in r_raw for x in ['mcdonald', 'kfc', 'burger king', 'primos', 'papa john']): return 'NAJWA'
-        if any(c in city for c in ['rabat', 'sale', 'temara', 'kenitra']): return 'HOUDA'
-        return 'CHAIMA'
-
-    df['AM'] = df.apply(get_am, axis=1)
-
-    # Automatisation
-    if 'Assigned By' in df.columns:
-        df['is_automated'] = df['Assigned By'].astype(str).str.contains('Algorithm|super_app', case=False, regex=True)
-    else: df['is_automated'] = False
-    
-    # Enseigne
-    def get_brand(name):
-        n = normalize_text(name)
-        if 'mcdonald' in n: return "McDonald's"
-        if 'kfc' in n: return "KFC"
-        if 'burger king' in n: return "Burger King"
-        if 'primos' in n: return "Primos"
-        return "Autres"
-    df['Enseigne_Groupe'] = df['restaurant name'].apply(get_brand)
-
-    return df
-
-# ---------------------------------------------------------
-# INTERFACE PRINCIPALE
-# ---------------------------------------------------------
-st.title("🚀 DASH-SBN | Performance Analytics")
-pipelines_norm = load_pipelines()
-
-with st.sidebar:
-    st.header("📂 Données")
-    uploaded_file = st.file_uploader("Fichier CSV", type=['csv'])
-    
-    if not uploaded_file:
-        # Fallback local (Optionnel)
-        local = "admin-earnings-orders-export_v1.3.1_countryCode=MA&filters=_s_1761955200000_e_1769212799999exp.csv"
-        # if os.path.exists(local): uploaded_file = local
-        pass
-
-    if uploaded_file:
-        df = load_data(uploaded_file, pipelines_norm)
+    for filename in pipeline_files:
+        try:
+            temp_df = pd.read_csv(filename)
+            # Nettoyage des noms de colonnes pour éviter les espaces
+            temp_df.columns = temp_df.columns.str.strip()
+            df_pipeline_list.append(temp_df)
+        except Exception as e:
+            st.warning(f"Impossible de lire {filename}: {e}")
+            
+    if df_pipeline_list:
+        df_pipeline = pd.concat(df_pipeline_list, ignore_index=True)
     else:
-        st.info("Chargez le fichier CSV.")
-        st.stop()
-        
+        st.error("Aucun fichier 'pipline AM' trouvé.")
+        return None, None
+
+    # Sélection et renommage des colonnes utiles du Pipeline
+    # On s'assure d'avoir l'ID pour la jointure
+    # Colonnes attendues : ID, Restaurant Name, Created At, MAIN CITY, Commission %, Priority
+    cols_to_keep = ['ID', 'Restaurant Name', 'Created At', 'MAIN CITY', 'Commission %', 'Priority']
+    # Vérification si les colonnes existent
+    cols_to_keep = [c for c in cols_to_keep if c in df_pipeline.columns]
+    df_pipeline = df_pipeline[cols_to_keep].drop_duplicates(subset=['ID'])
+    
+    # 2. Chargement du fichier Data Extraction (Orders)
+    # On cherche le fichier qui commence par admin-earnings
+    order_files = glob.glob("admin-earnings-orders-export*.csv")
+    if order_files:
+        df_orders = pd.read_csv(order_files[0])
+    else:
+        st.error("Fichier d'extraction des commandes (admin-earnings...) introuvable.")
+        return None, None
+
+    # --- NETTOYAGE & TRANSFORMATION ---
+    
+    # Conversion des dates
+    df_orders['order day'] = pd.to_datetime(df_orders['order day'], errors='coerce')
+    
+    # Calcul des KPIs au niveau Commande
+    # GMV = item total
+    # Statut Annulé = Si status != 'Delivered' (ou check cancelled at)
+    df_orders['is_cancelled'] = df_orders['status'].apply(lambda x: 1 if x != 'Delivered' else 0)
+    df_orders['GMV'] = df_orders['item total']
+    
+    # JOINTURE (Merge)
+    # Pipeline (ID) -> Orders (Restaurant ID)
+    df_merged = pd.merge(
+        df_orders, 
+        df_pipeline, 
+        left_on='Restaurant ID', 
+        right_on='ID', 
+        how='left'
+    )
+    
+    # Remplir les noms de restaurants manquants par "Inconnu" ou celui du fichier orders
+    df_merged['Restaurant Name'] = df_merged['Restaurant Name'].fillna(df_merged['restaurant name'])
+    df_merged['MAIN CITY'] = df_merged['MAIN CITY'].fillna(df_merged['city'])
+    
+    return df_merged
+
+# --- CHARGEMENT ---
+df = load_data()
+
+if df is not None:
+    # --- SIDEBAR FILTERS ---
+    st.sidebar.header("🔍 Filtres")
+    
+    # Filtre Date
+    min_date = df['order day'].min()
+    max_date = df['order day'].max()
+    
+    start_date, end_date = st.sidebar.date_input(
+        "Période",
+        value=[min_date, max_date],
+        min_value=min_date,
+        max_value=max_date
+    )
+    
+    # Filtre Ville
+    cities = sorted(df['MAIN CITY'].dropna().unique())
+    selected_cities = st.sidebar.multiselect("Ville", cities, default=cities)
+    
+    # Filtrage des données
+    mask = (
+        (df['order day'].dt.date >= start_date) & 
+        (df['order day'].dt.date <= end_date) &
+        (df['MAIN CITY'].isin(selected_cities))
+    )
+    df_filtered = df[mask]
+
+    # --- MAIN DASHBOARD ---
+    st.title("🟣 Dashboard de Performance Restaurants")
+    st.markdown("Suivi des KPIs clés : GMV, Commandes, Annulations & Performance Partenaires")
+    
+    # --- KPI HEADER (GLOBAL) ---
+    total_gmv = df_filtered['GMV'].sum()
+    total_orders = len(df_filtered)
+    total_cancelled = df_filtered['is_cancelled'].sum()
+    cancellation_rate = (total_cancelled / total_orders * 100) if total_orders > 0 else 0
+    active_restaurants = df_filtered['Restaurant ID'].nunique()
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("💰 GMV Total", f"{total_gmv:,.0f} DH")
+    col2.metric("📦 Commandes Totales", f"{total_orders:,.0f}")
+    col3.metric("⚠️ Taux d'Annulation", f"{cancellation_rate:.2f} %")
+    col4.metric("🏪 Restaurants Actifs", f"{active_restaurants}")
+    
     st.divider()
-    st.header("🎯 Scope & Filtres")
+
+    # --- SECTION 1: TOP 10 & FLOP 10 ---
+    st.subheader("🏆 Top & Flop Performance")
     
-    # 1. SCOPE
-    scope_options = ['Global', 'NAJWA', 'HOUDA', 'CHAIMA']
-    selected_scope = st.selectbox("Vue (Scope)", scope_options)
+    # Calcul des métriques par restaurant
+    df_rest_kpi = df_filtered.groupby('Restaurant Name').agg({
+        'GMV': 'sum',
+        'order id': 'count',
+        'is_cancelled': 'sum',
+        'MAIN CITY': 'first'
+    }).rename(columns={'order id': 'Total Orders', 'is_cancelled': 'Cancelled Orders'})
     
-    # 2. ENSEIGNE
-    if selected_scope != 'Global':
-        df_scope_preview = df[df['AM'] == selected_scope]
-        available_brands = ['Tous'] + sorted(df_scope_preview['Enseigne_Groupe'].unique().tolist())
-    else:
-        available_brands = ['Tous'] + sorted(df['Enseigne_Groupe'].unique().tolist())
-        
-    sel_brand = st.selectbox("Enseigne / Groupe", available_brands)
+    df_rest_kpi['Cancellation Rate (%)'] = (df_rest_kpi['Cancelled Orders'] / df_rest_kpi['Total Orders'] * 100).round(2)
     
-    # 3. DATE
-    min_d, max_d = df['date'].min(), df['date'].max()
-    st.caption(f"Période dispo : {min_d} au {max_d}")
-
-# ---------------------------------------------------------
-# PRÉPARATION
-# ---------------------------------------------------------
-if selected_scope == 'Global':
-    df_scope = df.copy()
-    current_pipeline = []
-    for p_list in pipelines_norm.values(): current_pipeline.extend(p_list)
-    current_pipeline = list(set(current_pipeline))
-else:
-    df_scope = df[df['AM'] == selected_scope]
-    current_pipeline = pipelines_norm.get(selected_scope, [])
-
-if sel_brand != 'Tous':
-    df_scope = df_scope[df_scope['Enseigne_Groupe'] == sel_brand]
-
-if df_scope.empty:
-    st.warning("Aucune donnée.")
-    st.stop()
-
-# ---------------------------------------------------------
-# 1. KPI MENSUEL (MAIN TABLE)
-# ---------------------------------------------------------
-st.subheader(f"📊 Performance Mensuelle : {selected_scope}")
-
-monthly_stats = df_scope.groupby('year_month').agg({
-    'item total': 'sum',
-    'order id': 'count',
-    'is_automated': 'sum',
-    'status': lambda x: x.astype(str).str.contains('Reject|Cancel', case=False).sum()
-}).reset_index().sort_values('year_month')
-
-monthly_stats['Mois'] = monthly_stats['year_month'].dt.strftime('%Y-%m')
-monthly_stats['AOV'] = monthly_stats['item total'] / monthly_stats['order id']
-monthly_stats['Auto %'] = (monthly_stats['is_automated'] / monthly_stats['order id'] * 100)
-monthly_stats['Rejet/Cancel %'] = (monthly_stats['status'] / monthly_stats['order id'] * 100)
-monthly_stats['CA Prev'] = monthly_stats['item total'].shift(1)
-monthly_stats['Growth %'] = ((monthly_stats['item total'] - monthly_stats['CA Prev']) / monthly_stats['CA Prev'] * 100).fillna(0)
-
-# Inactifs Mensuels
-inactifs_list = []
-for ym in monthly_stats['year_month']:
-    actifs = df_scope[df_scope['year_month'] == ym]['restaurant_norm'].unique().tolist()
-    matched = 0
-    if len(current_pipeline) > 0:
-        for p in current_pipeline:
-            if any(p in a for a in actifs): matched += 1
-        inactifs_list.append(max(0, len(current_pipeline) - matched))
-    else:
-        inactifs_list.append(0)
-monthly_stats['Inactifs'] = inactifs_list
-
-final_table = monthly_stats[['Mois', 'item total', 'order id', 'AOV', 'Growth %', 'Auto %', 'Rejet/Cancel %', 'Inactifs']].rename(
-    columns={'item total': 'CA (MAD)', 'order id': 'Commandes', 'AOV': 'Panier Moy.'}
-)
-
-st.dataframe(
-    final_table.style.format({
-        "CA (MAD)": "{:,.0f}",
-        "Commandes": "{:.0f}",
-        "Panier Moy.": "{:.1f}",
-        "Growth %": "{:+.1f}%",
-        "Auto %": "{:.1f}%",
-        "Rejet/Cancel %": "{:.1f}%",
-        "Inactifs": "{:.0f}"
-    }).background_gradient(subset=['Growth %'], cmap="RdYlGn", vmin=-20, vmax=20),
-    use_container_width=True, hide_index=True
-)
-
-st.divider()
-
-# ---------------------------------------------------------
-# 2. TOP & FLOP (SCROLLABLE)
-# ---------------------------------------------------------
-st.subheader("📈 Tops & 📉 Flops (Scrollable)")
-
-all_months = sorted(df['year_month'].unique())
-if len(all_months) >= 2:
-    last_month = all_months[-1]
-    prev_month = all_months[-2]
-    st.info(f"Comparaison : **{last_month}** vs **{prev_month}**")
+    # Sélecteur de métrique pour le classement
+    sort_metric = st.selectbox("Classer par :", ["GMV", "Total Orders", "Cancellation Rate (%)"])
     
-    stats_m = df_scope[df_scope['year_month'] == last_month].groupby('restaurant name')['order id'].count()
-    stats_m_1 = df_scope[df_scope['year_month'] == prev_month].groupby('restaurant name')['order id'].count()
+    col_top, col_flop = st.columns(2)
     
-    comp_df = pd.DataFrame({'Mois Préc': stats_m_1, 'Mois Actuel': stats_m}).fillna(0)
-    comp_df['Delta'] = comp_df['Mois Actuel'] - comp_df['Mois Préc']
-    
-    col_flop, col_top = st.columns(2)
-    
-    with col_flop:
-        st.markdown("### 🚨 Top Régressions")
-        flops = comp_df[comp_df['Delta'] < 0].sort_values('Delta', ascending=True)
-        if not flops.empty:
-            st.dataframe(
-                flops[['Mois Préc', 'Mois Actuel', 'Delta']].style.format("{:.0f}").background_gradient(subset=['Delta'], cmap='Reds_r'),
-                use_container_width=True, 
-                height=300 # SCROLLABLE FIXED HEIGHT
-            )
-        else: st.success("Rien à signaler.")
-
     with col_top:
-        st.markdown("### 🚀 Top Progressions")
-        tops = comp_df[comp_df['Delta'] > 0].sort_values('Delta', ascending=False)
-        if not tops.empty:
-            st.dataframe(
-                tops[['Mois Préc', 'Mois Actuel', 'Delta']].style.format("{:.0f}").background_gradient(subset=['Delta'], cmap='Greens'),
-                use_container_width=True, 
-                height=300 # SCROLLABLE FIXED HEIGHT
-            )
-        else: st.info("Rien à signaler.")
-else:
-    st.warning("Pas assez d'historique pour Top/Flop.")
-
-st.divider()
-
-# ---------------------------------------------------------
-# 3. ANALYSE CROISÉE (CANCELLATION x DELIVERY TIME)
-# ---------------------------------------------------------
-st.subheader("🚫 Analyse des Annulations & Temps de Livraison")
-
-# On prépare les données par restaurant (sur la période sélectionnée globale ou tout l'historique dispo)
-# On calcule : Taux d'annulation, Temps moyen de livraison (pour les commandes livrées)
-resto_stats = df_scope.groupby('restaurant name').agg({
-    'order id': 'count',
-    'status': lambda x: x.astype(str).str.contains('Cancel|Reject', case=False).sum(),
-    'delivery time(M)': 'mean', # Temps de livraison moyen (pour celles livrées)
-    'AM': 'first' # Pour la couleur du graphe
-}).reset_index()
-
-resto_stats.columns = ['Restaurant', 'Total Orders', 'Cancelled', 'Avg Delivery Time (min)', 'AM']
-resto_stats['Cancellation Rate (%)'] = (resto_stats['Cancelled'] / resto_stats['Total Orders'] * 100).round(1)
-
-# Filtre pour éviter le bruit (ex: on garde seulement ceux > 5 commandes)
-resto_stats_clean = resto_stats[resto_stats['Total Orders'] >= 5]
-
-c1, c2 = st.columns([1, 2])
-
-with c1:
-    st.markdown("### ⚠️ Top Taux d'Annulation")
-    # Table scrollable des pires taux
-    top_cancel = resto_stats_clean.sort_values('Cancellation Rate (%)', ascending=False).head(50)
-    st.dataframe(
-        top_cancel[['Restaurant', 'Total Orders', 'Cancellation Rate (%)']].style.format({
-            'Total Orders': "{:.0f}", 
-            'Cancellation Rate (%)': "{:.1f}%"
-        }).background_gradient(subset=['Cancellation Rate (%)'], cmap='Reds'),
-        use_container_width=True,
-        height=400
-    )
-
-with c2:
-    st.markdown("### 📉 Corrélation : Temps de Livraison vs Annulation")
-    st.caption("Chaque bulle est un restaurant. Plus la bulle est haute, plus le taux d'annulation est élevé. Plus elle est à droite, plus le resto est lent.")
-    
-    if not resto_stats_clean.empty:
-        fig = px.scatter(
-            resto_stats_clean,
-            x='Avg Delivery Time (min)',
-            y='Cancellation Rate (%)',
-            size='Total Orders', # Taille de la bulle = Volume
-            color='AM', # Couleur par AM (si vue Global) ou unique
-            hover_name='Restaurant',
-            title="Impact de la Lenteur sur les Annulations",
-            template="plotly_white"
-        )
-        # Ligne moyenne
-        avg_cancel = resto_stats_clean['Cancellation Rate (%)'].mean()
-        fig.add_hline(y=avg_cancel, line_dash="dash", line_color="red", annotation_text="Moyenne Annulation")
+        st.markdown("### 🚀 Top 10")
+        # Tri descendant pour GMV/Orders, Ascendant pour Cancellation Rate (si on veut le meilleur taux)
+        # Mais pour "Top" on veut généralement le plus haut chiffre (sauf pour taux d'annulation où c'est l'inverse)
+        ascending = True if sort_metric == "Cancellation Rate (%)" else False
         
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Pas assez de données pour le graphique.")
+        top_10 = df_rest_kpi.sort_values(by=sort_metric, ascending=ascending).head(10)
+        st.dataframe(top_10.style.background_gradient(cmap="Purples"))
+        
+    with col_flop:
+        st.markdown("### 📉 Flop 10")
+        # Inverse du Top
+        flop_10 = df_rest_kpi.sort_values(by=sort_metric, ascending=not ascending).head(10)
+        st.dataframe(flop_10.style.background_gradient(cmap="Reds"))
 
-# ---------------------------------------------------------
-# 4. DATA RAW
-# ---------------------------------------------------------
-with st.expander("Voir les données brutes"):
-    st.dataframe(df_scope)
+    st.divider()
+
+    # --- SECTION 2: COURBES DE TENDANCE ---
+    st.subheader("📈 Analyse de Tendance")
+    
+    col_trend_1, col_trend_2 = st.columns([1, 3])
+    
+    with col_trend_1:
+        # Filtres spécifiques au graphe
+        trend_metric = st.radio("Métrique à visualiser", ["GMV", "Total Orders", "Cancellation Rate"])
+        
+        # Liste des restos triés par GMV pour faciliter la recherche
+        top_restos_list = df_rest_kpi.sort_values(by='GMV', ascending=False).index.tolist()
+        selected_restos_trend = st.multiselect(
+            "Comparer Restaurants (Max 5 recommandés)", 
+            top_restos_list,
+            default=top_restos_list[:3] # Par défaut les 3 plus gros
+        )
+        
+    with col_trend_2:
+        if selected_restos_trend:
+            # Préparation données temporelles
+            df_trend = df_filtered[df_filtered['Restaurant Name'].isin(selected_restos_trend)].copy()
+            df_trend = df_trend.groupby(['order day', 'Restaurant Name']).agg({
+                'GMV': 'sum',
+                'order id': 'count',
+                'is_cancelled': 'mean' # mean de 0/1 donne le %
+            }).reset_index()
+            
+            # Renommage pour le graphique
+            if trend_metric == "Cancellation Rate":
+                df_trend['Value'] = df_trend['is_cancelled'] * 100
+                y_label = "Taux d'Annulation (%)"
+            elif trend_metric == "Total Orders":
+                df_trend['Value'] = df_trend['order id']
+                y_label = "Nombre de Commandes"
+            else:
+                df_trend['Value'] = df_trend['GMV']
+                y_label = "GMV (DH)"
+            
+            fig = px.line(
+                df_trend, 
+                x='order day', 
+                y='Value', 
+                color='Restaurant Name',
+                title=f"Évolution {y_label} par Restaurant",
+                color_discrete_sequence=px.colors.sequential.Bluered_r
+            )
+            fig.update_layout(xaxis_title="Date", yaxis_title=y_label)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Veuillez sélectionner au moins un restaurant à gauche.")
+
+    st.divider()
+
+    # --- SECTION 3: VUE GLOBALE DÉTAILLÉE ---
+    st.subheader("📋 Vue Globale & Détails")
+    
+    with st.expander("Voir le tableau complet des performances"):
+        # On reprend le df_rest_kpi calculé plus haut
+        st.dataframe(
+            df_rest_kpi.sort_values(by="GMV", ascending=False),
+            use_container_width=True,
+            column_config={
+                "GMV": st.column_config.NumberColumn(format="%.0f DH"),
+                "Cancellation Rate (%)": st.column_config.ProgressColumn(format="%.2f %%", min_value=0, max_value=100)
+            }
+        )
+    
+    # Petit bonus : Histogramme de distribution des commissions si la donnée existe
+    if 'Commission %' in df_filtered.columns and df_filtered['Commission %'].notna().any():
+        st.subheader("📊 Distribution des Commissions")
+        fig_comm = px.histogram(
+            df_filtered.drop_duplicates(subset=['Restaurant ID']), 
+            x='Commission %', 
+            nbins=20, 
+            color_discrete_sequence=['#6c35de'],
+            title="Répartition des Taux de Commission (Partenaires Uniques)"
+        )
+        st.plotly_chart(fig_comm, use_container_width=True)
+
+else:
+    st.stop()
