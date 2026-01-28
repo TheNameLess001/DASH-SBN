@@ -117,82 +117,83 @@ def display_advanced_kpis(df_input, title_prefix=""):
     """
     Affiche la section Rentabilité & Efficacité (Big Numbers + Tableau détaillé).
     """
-    st.markdown(f"### 💎 {title_prefix} Analyse Avancée : Rentabilité & Efficacité")
-    st.markdown("Metrics croisés pour aller au-delà du simple GMV.")
+    st.markdown(f"### 💎 {title_prefix} Analyse Avancée : Financier (Gain/Perte) & Ops")
+    st.markdown("Vision P&L : Chiffre d'Affaires, Gains Réels (Commissions) et Pertes (Manque à gagner).")
 
     # Calculs Globaux de la section
-    net_rev_total = df_input['Net Revenue'].sum()
-    missed_gmv_total = df_input['Missed GMV'].sum()
+    total_gmv = df_input['GMV'].sum()
+    net_rev_total = df_input['Net Revenue'].sum()       # Gain (Commissions)
+    missed_gmv_total = df_input['Missed GMV'].sum()     # Perte Volume
+    missed_comm_total = df_input['Missed Comm'].sum()   # Perte Financière (Commissions ratées)
     
     # Coupon Dependency
     total_coupon = df_input['coupon discount'].sum() if 'coupon discount' in df_input.columns else 0
-    total_gmv = df_input['GMV'].sum()
     coupon_dep_rate = (total_coupon / total_gmv * 100) if total_gmv > 0 else 0
     
-    # Logistique (Distance & Vitesse)
-    avg_dist = df_input['Distance travel'].mean() if 'Distance travel' in df_input.columns else 0
-    # Vitesse approx (km/h) = (Dist / Time_min) * 60
-    # On fait la moyenne des vitesses ligne à ligne pour plus de précision, ou moyenne globale
-    # Attention aux divisions par zéro
+    # Vitesse Moyenne
     valid_speed = df_input[(df_input['delivery time(M)'] > 0) & (df_input['Distance travel'] > 0)]
-    if not valid_speed.empty:
-        avg_speed = (valid_speed['Distance travel'] / valid_speed['delivery time(M)'] * 60).mean()
-    else:
-        avg_speed = 0
+    avg_speed = (valid_speed['Distance travel'] / valid_speed['delivery time(M)'] * 60).mean() if not valid_speed.empty else 0
 
-    # Affichage Big Numbers
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("💎 Net Revenue (Commissions)", f"{net_rev_total:,.0f} DH", help="Ce que Yassir gagne réellement (GMV x Com%)")
-    k2.metric("💸 Missed GMV (Annulations)", f"{missed_gmv_total:,.0f} DH", help="CA perdu à cause des annulations")
-    k3.metric("🎟️ Dépendance Promo", f"{coupon_dep_rate:.1f}%", help="Part du GMV issue des coupons (Doit être faible)")
-    k4.metric("🚀 Vitesse Moyenne", f"{avg_speed:.1f} km/h", help="Efficacité logistique (Distance / Temps)")
+    # Affichage Big Numbers (5 colonnes pour inclure le CA et la Perte Financière)
+    k0, k1, k2, k3, k4 = st.columns(5)
+    
+    k0.metric("💰 CA Total (GMV)", f"{total_gmv:,.0f} DH", help="Volume d'Affaires Global")
+    k1.metric("✅ Gain (Commissions)", f"{net_rev_total:,.0f} DH", help="Revenu Net Yassir (GMV x Com%)")
+    k2.metric("📉 Perte Financière", f"{missed_comm_total:,.0f} DH", help="Commissions perdues sur annulations")
+    k3.metric("🚫 Volume Perdu", f"{missed_gmv_total:,.0f} DH", help="GMV Total annulé (Manque à gagner ecosystème)")
+    k4.metric("🎟️ Dépendance Promo", f"{coupon_dep_rate:.1f}%", help="Part du GMV issue des coupons")
 
     # Tableau Détaillé par Restaurant
-    st.markdown("#### 📋 Détail par Restaurant (Rentabilité & Ops)")
+    st.markdown("#### 📋 Détail Financier par Restaurant (P&L)")
     
     # Aggrégation
     df_adv = df_input.groupby(['Restaurant_Final', 'City_Final']).agg({
+        'GMV': 'sum',
         'Net Revenue': 'sum',
         'Missed GMV': 'sum',
-        'GMV': 'sum',
-        'coupon discount': 'sum' if 'coupon discount' in df_input.columns else 'count', # count is dummy if missing
+        'Missed Comm': 'sum',
+        'coupon discount': 'sum' if 'coupon discount' in df_input.columns else 'count',
         'Distance travel': 'mean',
         'Delivery Time': 'mean'
     }).reset_index()
     
-    # Calculs dérivés par resto
+    # Calculs dérivés
     df_adv['Coupon Dep. %'] = (df_adv['coupon discount'] / df_adv['GMV'] * 100).fillna(0)
-    # Vitesse Moyenne par resto
     df_adv['Vitesse (km/h)'] = (df_adv['Distance travel'] / df_adv['Delivery Time'] * 60).fillna(0)
     
-    # Mise en forme
+    # Arrondis
+    df_adv['GMV'] = df_adv['GMV'].round(0)
     df_adv['Net Revenue'] = df_adv['Net Revenue'].round(0)
     df_adv['Missed GMV'] = df_adv['Missed GMV'].round(0)
-    df_adv['Distance travel'] = df_adv['Distance travel'].round(1)
-    df_adv['Vitesse (km/h)'] = df_adv['Vitesse (km/h)'].round(1)
+    df_adv['Missed Comm'] = df_adv['Missed Comm'].round(0)
     df_adv['Coupon Dep. %'] = df_adv['Coupon Dep. %'].round(1)
     
-    # Sélection et Renommage
-    cols_final = [
-        'Restaurant_Final', 'City_Final', 
-        'Net Revenue', 'Missed GMV', 
-        'Coupon Dep. %', 
-        'Distance travel', 'Vitesse (km/h)'
-    ]
-    
-    df_show = df_adv[cols_final].rename(columns={
-        'Net Revenue': 'Rev. Net (DH)',
-        'Missed GMV': 'Perte Sèche (DH)',
-        'Coupon Dep. %': 'Effort Promo %',
-        'Distance travel': 'Dist. Moy (km)'
+    # Renommage
+    df_show = df_adv.rename(columns={
+        'GMV': 'CA (GMV)',
+        'Net Revenue': 'Gain (Commissions)',
+        'Missed Comm': 'Perte (Commissions)',
+        'Missed GMV': 'Vol. Perdu (Annul.)',
+        'Coupon Dep. %': 'Effort Promo %'
     })
     
-    # Tri par défaut : Rev Net
-    df_show = df_show.sort_values('Rev. Net (DH)', ascending=False)
+    # Sélection Colonnes
+    cols_final = [
+        'Restaurant_Final', 'City_Final', 
+        'CA (GMV)', 
+        'Gain (Commissions)', 
+        'Perte (Commissions)', 
+        'Vol. Perdu (Annul.)', 
+        'Effort Promo %'
+    ]
+    
+    # Tri par défaut : Gain
+    df_show = df_show.sort_values('Gain (Commissions)', ascending=False)
     
     st.dataframe(
-        df_show.style.background_gradient(cmap="Greens", subset=['Rev. Net (DH)'])
-                     .background_gradient(cmap="Reds", subset=['Perte Sèche (DH)', 'Effort Promo %']),
+        df_show[cols_final].style
+        .background_gradient(cmap="Greens", subset=['Gain (Commissions)'])
+        .background_gradient(cmap="Reds", subset=['Perte (Commissions)', 'Vol. Perdu (Annul.)']),
         use_container_width=True
     )
 
@@ -231,26 +232,25 @@ if orders_file and pipeline_file:
         df_full['is_cancelled'] = df_full['status'].apply(lambda x: 1 if str(x).lower() != 'delivered' else 0)
         df_full['GMV'] = pd.to_numeric(df_full['item total'], errors='coerce').fillna(0)
         df_full['Delivery Time'] = pd.to_numeric(df_full['delivery time(M)'], errors='coerce')
-        if 'Distance travel' not in df_full.columns:
-            df_full['Distance travel'] = 0 # Fallback
-        else:
-            df_full['Distance travel'] = pd.to_numeric(df_full['Distance travel'], errors='coerce').fillna(0)
-            
-        if 'coupon discount' not in df_full.columns:
-            df_full['coupon discount'] = 0
-        else:
-             df_full['coupon discount'] = pd.to_numeric(df_full['coupon discount'], errors='coerce').fillna(0)
+        if 'Distance travel' not in df_full.columns: df_full['Distance travel'] = 0
+        else: df_full['Distance travel'] = pd.to_numeric(df_full['Distance travel'], errors='coerce').fillna(0)
+        if 'coupon discount' not in df_full.columns: df_full['coupon discount'] = 0
+        else: df_full['coupon discount'] = pd.to_numeric(df_full['coupon discount'], errors='coerce').fillna(0)
 
-        # --- KPI CALCULATIONS ---
-        # Commission Cleaning
+        # --- KPI FINANCIERS ---
+        # 1. Commission Cleaning
         if 'COMMISSION %' in df_full.columns:
             df_full['Commission_Clean'] = pd.to_numeric(df_full['COMMISSION %'], errors='coerce').fillna(0)
             df_full['Commission_Clean'] = df_full['Commission_Clean'].apply(lambda x: x/100 if x > 1 else x)
-            df_full['Net Revenue'] = df_full['GMV'] * df_full['Commission_Clean']
         else:
-            df_full['Net Revenue'] = 0
-
+            df_full['Commission_Clean'] = 0
+            
+        # 2. Gain (Revenue Net)
+        df_full['Net Revenue'] = df_full['GMV'] * df_full['Commission_Clean']
+        
+        # 3. Perte (Manque à Gagner)
         df_full['Missed GMV'] = df_full['is_cancelled'] * df_full['GMV']
+        df_full['Missed Comm'] = df_full['is_cancelled'] * (df_full['GMV'] * df_full['Commission_Clean'])
 
         # Filtre Date
         with st.sidebar:
@@ -314,7 +314,7 @@ if orders_file and pipeline_file:
             
             st.divider()
             
-            # --- NOUVELLE SECTION BAS DE PAGE : KPIS AVANCÉS ---
+            # --- SECTION BAS DE PAGE : KPIS FINANCIERS ---
             display_advanced_kpis(df_view, title_prefix="(Vue AM)")
 
 
@@ -325,7 +325,7 @@ if orders_file and pipeline_file:
             k1.metric("GMV Total", f"{df_filtered['GMV'].sum():,.0f} DH")
             k2.metric("Commandes", f"{len(df_filtered):,.0f}")
             k3.metric("Taux Annul.", f"{(df_filtered['is_cancelled'].mean()*100):.2f}%")
-            k4.metric("Perte Sèche Totale", f"{df_filtered['Missed GMV'].sum():,.0f} DH")
+            k4.metric("Perte Sèche (Vol.)", f"{df_filtered['Missed GMV'].sum():,.0f} DH")
 
             st.subheader("📅 Evolution Mensuelle Globale")
             df_evo_global = get_monthly_evolution_table(df_filtered)
@@ -342,7 +342,7 @@ if orders_file and pipeline_file:
             
             st.divider()
 
-            # --- NOUVELLE SECTION BAS DE PAGE : KPIS AVANCÉS ---
+            # --- SECTION BAS DE PAGE : KPIS FINANCIERS ---
             display_advanced_kpis(df_filtered, title_prefix="(Vue Globale)")
 
     else:
