@@ -23,50 +23,36 @@ st.markdown("""
 
 @st.cache_data
 def load_pipeline_excel(uploaded_file):
-    """
-    Lit un fichier Excel avec plusieurs feuilles.
-    Chaque feuille correspond à un AM.
-    """
     if uploaded_file is None:
         return pd.DataFrame()
-    
     try:
-        # sheet_name=None permet de lire TOUTES les feuilles dans un dictionnaire
         xls = pd.read_excel(uploaded_file, sheet_name=None)
-        
         all_data = []
-        
         for sheet_name, df_sheet in xls.items():
-            # Nettoyage des colonnes (Majuscules + sans espaces)
             df_sheet.columns = df_sheet.columns.str.strip().str.upper()
-            
-            # On assigne le nom de l'onglet comme nom de l'AM
             df_sheet['AM_OWNER'] = sheet_name
-            
             all_data.append(df_sheet)
-            
         if all_data:
-            final_df = pd.concat(all_data, ignore_index=True)
-            return final_df
-        else:
-            return pd.DataFrame()
-
+            return pd.concat(all_data, ignore_index=True)
+        return pd.DataFrame()
     except Exception as e:
-        st.error(f"❌ Erreur lors de la lecture du fichier Excel Pipeline : {e}")
+        st.error(f"❌ Erreur Excel Pipeline : {e}")
         return pd.DataFrame()
 
 @st.cache_data
 def load_orders_csv(uploaded_file):
     if uploaded_file is not None:
         try:
-            df = pd.read_csv(uploaded_file)
-            return df
+            return pd.read_csv(uploaded_file)
         except Exception as e:
-            st.error(f"❌ Erreur lecture Admin Earnings : {e}")
+            st.error(f"❌ Erreur CSV Admin : {e}")
     return None
 
 def get_monthly_evolution_table(df):
-    """Génère un tableau récapitulatif par mois avec calculs de progression (Growth)."""
+    """
+    Génère un tableau mensuel avec Prog/Reg.
+    CORRECTION : Pour Annulation et Temps, une BAISSE est une PROGRESSION (Inversion du signe).
+    """
     if df.empty:
         return pd.DataFrame()
         
@@ -78,48 +64,44 @@ def get_monthly_evolution_table(df):
         'Delivery Time': 'mean'
     }).reset_index().rename(columns={'order day': 'Mois'})
     
-    # 2. Tri chronologique (Ascendant) pour calculer la progression
+    # 2. Tri chronologique pour le calcul
     df_monthly = df_monthly.sort_values('Mois', ascending=True)
     
-    # 3. Calculs KPIs dérivés
+    # 3. KPIs dérivés
     df_monthly['AOV'] = df_monthly['GMV'] / df_monthly['order id']
     df_monthly['Cancel Rate'] = df_monthly['is_cancelled'] * 100
     
-    # 4. Calcul de la CROISSANCE (Prog/Reg) vs Mois Précédent
-    # pct_change() calcule la variation en pourcentage
+    # 4. Calcul CROISSANCE (Prog/Reg)
+    # Pour GMV, Commandes, AOV : Hausse = Positif (+)
     df_monthly['Growth GMV'] = df_monthly['GMV'].pct_change() * 100
     df_monthly['Growth Orders'] = df_monthly['order id'].pct_change() * 100
     df_monthly['Growth AOV'] = df_monthly['AOV'].pct_change() * 100
-    df_monthly['Growth Cancel'] = df_monthly['Cancel Rate'].pct_change() * 100
-    df_monthly['Growth Time'] = df_monthly['Delivery Time'].pct_change() * 100
     
-    # 5. Tri décroissant (Mois le plus récent en haut) pour l'affichage
+    # Pour Annulation et Temps : Baisse = Positif (+), Hausse = Négatif (-)
+    df_monthly['Growth Cancel'] = df_monthly['Cancel Rate'].pct_change() * -1 * 100
+    df_monthly['Growth Time'] = df_monthly['Delivery Time'].pct_change() * -1 * 100
+    
+    # 5. Tri décroissant (Mois récent en haut)
     df_monthly = df_monthly.sort_values('Mois', ascending=False)
     
-    # 6. Mise en forme (Arrondis)
+    # 6. Arrondis
     df_monthly['GMV'] = df_monthly['GMV'].round(0)
     df_monthly['AOV'] = df_monthly['AOV'].round(0)
     df_monthly['Cancel Rate'] = df_monthly['Cancel Rate'].round(2)
     df_monthly['Delivery Time'] = df_monthly['Delivery Time'].round(1)
     
-    # 7. Renommage et Organisation des colonnes
+    # 7. Renommage
     cols_map = {
         'Mois': 'Mois',
-        'GMV': 'CA (GMV)',
-        'Growth GMV': 'Prog/Reg CA %',
-        'order id': 'Commandes',
-        'Growth Orders': 'Prog/Reg Cmd %',
-        'AOV': 'Panier Moyen',
-        'Growth AOV': 'Prog/Reg AOV %',
-        'Cancel Rate': 'Taux Annul %',
-        'Growth Cancel': 'Prog/Reg Annul %',
-        'Delivery Time': 'Temps Livr.',
-        'Growth Time': 'Prog/Reg Temps %'
+        'GMV': 'CA (GMV)', 'Growth GMV': 'Prog/Reg CA %',
+        'order id': 'Commandes', 'Growth Orders': 'Prog/Reg Cmd %',
+        'AOV': 'Panier Moyen', 'Growth AOV': 'Prog/Reg AOV %',
+        'Cancel Rate': 'Taux Annul %', 'Growth Cancel': 'Prog/Reg Annul %',
+        'Delivery Time': 'Temps Livr.', 'Growth Time': 'Prog/Reg Temps %'
     }
     
     df_final = df_monthly.rename(columns=cols_map)
     
-    # Ordre final : Métrique, puis sa progression
     ordered_cols = [
         'Mois', 
         'CA (GMV)', 'Prog/Reg CA %', 
@@ -131,228 +113,241 @@ def get_monthly_evolution_table(df):
     
     return df_final[ordered_cols]
 
-# --- APPLICATION PRINCIPALE ---
+def display_advanced_kpis(df_input, title_prefix=""):
+    """
+    Affiche la section Rentabilité & Efficacité (Big Numbers + Tableau détaillé).
+    """
+    st.markdown(f"### 💎 {title_prefix} Analyse Avancée : Rentabilité & Efficacité")
+    st.markdown("Metrics croisés pour aller au-delà du simple GMV.")
+
+    # Calculs Globaux de la section
+    net_rev_total = df_input['Net Revenue'].sum()
+    missed_gmv_total = df_input['Missed GMV'].sum()
+    
+    # Coupon Dependency
+    total_coupon = df_input['coupon discount'].sum() if 'coupon discount' in df_input.columns else 0
+    total_gmv = df_input['GMV'].sum()
+    coupon_dep_rate = (total_coupon / total_gmv * 100) if total_gmv > 0 else 0
+    
+    # Logistique (Distance & Vitesse)
+    avg_dist = df_input['Distance travel'].mean() if 'Distance travel' in df_input.columns else 0
+    # Vitesse approx (km/h) = (Dist / Time_min) * 60
+    # On fait la moyenne des vitesses ligne à ligne pour plus de précision, ou moyenne globale
+    # Attention aux divisions par zéro
+    valid_speed = df_input[(df_input['delivery time(M)'] > 0) & (df_input['Distance travel'] > 0)]
+    if not valid_speed.empty:
+        avg_speed = (valid_speed['Distance travel'] / valid_speed['delivery time(M)'] * 60).mean()
+    else:
+        avg_speed = 0
+
+    # Affichage Big Numbers
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("💎 Net Revenue (Commissions)", f"{net_rev_total:,.0f} DH", help="Ce que Yassir gagne réellement (GMV x Com%)")
+    k2.metric("💸 Missed GMV (Annulations)", f"{missed_gmv_total:,.0f} DH", help="CA perdu à cause des annulations")
+    k3.metric("🎟️ Dépendance Promo", f"{coupon_dep_rate:.1f}%", help="Part du GMV issue des coupons (Doit être faible)")
+    k4.metric("🚀 Vitesse Moyenne", f"{avg_speed:.1f} km/h", help="Efficacité logistique (Distance / Temps)")
+
+    # Tableau Détaillé par Restaurant
+    st.markdown("#### 📋 Détail par Restaurant (Rentabilité & Ops)")
+    
+    # Aggrégation
+    df_adv = df_input.groupby(['Restaurant_Final', 'City_Final']).agg({
+        'Net Revenue': 'sum',
+        'Missed GMV': 'sum',
+        'GMV': 'sum',
+        'coupon discount': 'sum' if 'coupon discount' in df_input.columns else 'count', # count is dummy if missing
+        'Distance travel': 'mean',
+        'Delivery Time': 'mean'
+    }).reset_index()
+    
+    # Calculs dérivés par resto
+    df_adv['Coupon Dep. %'] = (df_adv['coupon discount'] / df_adv['GMV'] * 100).fillna(0)
+    # Vitesse Moyenne par resto
+    df_adv['Vitesse (km/h)'] = (df_adv['Distance travel'] / df_adv['Delivery Time'] * 60).fillna(0)
+    
+    # Mise en forme
+    df_adv['Net Revenue'] = df_adv['Net Revenue'].round(0)
+    df_adv['Missed GMV'] = df_adv['Missed GMV'].round(0)
+    df_adv['Distance travel'] = df_adv['Distance travel'].round(1)
+    df_adv['Vitesse (km/h)'] = df_adv['Vitesse (km/h)'].round(1)
+    df_adv['Coupon Dep. %'] = df_adv['Coupon Dep. %'].round(1)
+    
+    # Sélection et Renommage
+    cols_final = [
+        'Restaurant_Final', 'City_Final', 
+        'Net Revenue', 'Missed GMV', 
+        'Coupon Dep. %', 
+        'Distance travel', 'Vitesse (km/h)'
+    ]
+    
+    df_show = df_adv[cols_final].rename(columns={
+        'Net Revenue': 'Rev. Net (DH)',
+        'Missed GMV': 'Perte Sèche (DH)',
+        'Coupon Dep. %': 'Effort Promo %',
+        'Distance travel': 'Dist. Moy (km)'
+    })
+    
+    # Tri par défaut : Rev Net
+    df_show = df_show.sort_values('Rev. Net (DH)', ascending=False)
+    
+    st.dataframe(
+        df_show.style.background_gradient(cmap="Greens", subset=['Rev. Net (DH)'])
+                     .background_gradient(cmap="Reds", subset=['Perte Sèche (DH)', 'Effort Promo %']),
+        use_container_width=True
+    )
+
+# --- APP ---
 
 st.title("🟣 Yassir Analytics Dashboard")
 st.markdown("**Performance Commerciale & Opérationnelle**")
 
-# --- SIDEBAR : UPLOADS ---
+# SIDEBAR
 with st.sidebar:
-    st.header("📂 Importation des Données")
-    
-    st.markdown("### 1. Données Commandes")
-    orders_file = st.file_uploader("Uploader 'Admin Earnings' (.csv)", type=['csv'])
-    
-    st.markdown("### 2. Pipeline AMs")
-    pipeline_file = st.file_uploader("Uploader 'Pipeline Global' (.xlsx)", type=['xlsx'])
-    
-    st.info("💡 Le fichier Excel Pipeline doit contenir une feuille par AM.")
+    st.header("📂 Données")
+    orders_file = st.file_uploader("1. Admin Earnings (.csv)", type=['csv'])
+    pipeline_file = st.file_uploader("2. Pipeline Global (.xlsx)", type=['xlsx'])
 
-# --- TRAITEMENT DES DONNÉES ---
-
-if orders_file is not None and pipeline_file is not None:
-    
-    # 1. Chargement
+if orders_file and pipeline_file:
     df_orders = load_orders_csv(orders_file)
     df_pipeline = load_pipeline_excel(pipeline_file)
     
     if not df_orders.empty and not df_pipeline.empty:
-        
-        # 2. Préparation Admin Earnings
         df_orders['order day'] = pd.to_datetime(df_orders['order day'], errors='coerce')
         
-        # 3. Fusion (Merge)
-        if 'ID' in df_pipeline.columns:
-            join_key = 'ID'
-        elif 'RESTAURANT ID' in df_pipeline.columns:
-             join_key = 'RESTAURANT ID'
-        else:
-            st.error(f"❌ Colonne 'ID' introuvable dans le fichier Excel. Colonnes détectées : {list(df_pipeline.columns)}")
+        # Merge
+        join_key = 'ID' if 'ID' in df_pipeline.columns else 'RESTAURANT ID'
+        if join_key not in df_pipeline.columns:
+            st.error("Colonne ID manquante dans Pipeline")
             st.stop()
-
-        # Fusion Left
-        df_full = pd.merge(
-            df_orders,
-            df_pipeline,
-            left_on='Restaurant ID',
-            right_on=join_key,
-            how='left'
-        )
-        
-        # 4. Nettoyage post-fusion
-        df_full['AM_OWNER'] = df_full['AM_OWNER'].fillna('Non Assigné / Organique')
-        
-        if 'RESTAURANT NAME' in df_full.columns:
-            df_full['Restaurant_Final'] = df_full['RESTAURANT NAME'].fillna(df_full['restaurant name'])
-        else:
-            df_full['Restaurant_Final'] = df_full['restaurant name']
             
-        if 'MAIN CITY' in df_full.columns:
-            df_full['City_Final'] = df_full['MAIN CITY'].fillna(df_full['city'])
-        else:
-            df_full['City_Final'] = df_full['city']
+        df_full = pd.merge(df_orders, df_pipeline, left_on='Restaurant ID', right_on=join_key, how='left')
+        
+        # Clean
+        df_full['AM_OWNER'] = df_full['AM_OWNER'].fillna('Non Assigné')
+        df_full['Restaurant_Final'] = df_full['RESTAURANT NAME'].fillna(df_full['restaurant name']) if 'RESTAURANT NAME' in df_full.columns else df_full['restaurant name']
+        df_full['City_Final'] = df_full['MAIN CITY'].fillna(df_full['city']) if 'MAIN CITY' in df_full.columns else df_full['city']
 
-        # 5. Calcul des KPIs
+        # KPIs Base
         df_full['is_cancelled'] = df_full['status'].apply(lambda x: 1 if str(x).lower() != 'delivered' else 0)
         df_full['GMV'] = pd.to_numeric(df_full['item total'], errors='coerce').fillna(0)
         df_full['Delivery Time'] = pd.to_numeric(df_full['delivery time(M)'], errors='coerce')
+        if 'Distance travel' not in df_full.columns:
+            df_full['Distance travel'] = 0 # Fallback
+        else:
+            df_full['Distance travel'] = pd.to_numeric(df_full['Distance travel'], errors='coerce').fillna(0)
+            
+        if 'coupon discount' not in df_full.columns:
+            df_full['coupon discount'] = 0
+        else:
+             df_full['coupon discount'] = pd.to_numeric(df_full['coupon discount'], errors='coerce').fillna(0)
 
-        # --- FILTRE DATE GLOBAL ---
+        # --- KPI CALCULATIONS ---
+        # Commission Cleaning
+        if 'COMMISSION %' in df_full.columns:
+            df_full['Commission_Clean'] = pd.to_numeric(df_full['COMMISSION %'], errors='coerce').fillna(0)
+            df_full['Commission_Clean'] = df_full['Commission_Clean'].apply(lambda x: x/100 if x > 1 else x)
+            df_full['Net Revenue'] = df_full['GMV'] * df_full['Commission_Clean']
+        else:
+            df_full['Net Revenue'] = 0
+
+        df_full['Missed GMV'] = df_full['is_cancelled'] * df_full['GMV']
+
+        # Filtre Date
         with st.sidebar:
             st.divider()
-            st.header("📅 Période d'analyse")
-            min_d = df_full['order day'].min().date()
-            max_d = df_full['order day'].max().date()
-            dates = st.date_input("Sélectionner la plage :", [min_d, max_d])
-            
-            if len(dates) == 2:
-                mask = (df_full['order day'].dt.date >= dates[0]) & (df_full['order day'].dt.date <= dates[1])
-                df_filtered = df_full[mask]
-            else:
-                df_filtered = df_full
+            min_d, max_d = df_full['order day'].min().date(), df_full['order day'].max().date()
+            dates = st.date_input("Période", [min_d, max_d])
+            mask = (df_full['order day'].dt.date >= dates[0]) & (df_full['order day'].dt.date <= dates[1]) if len(dates)==2 else True
+            df_filtered = df_full[mask]
 
-        # --- DASHBOARD VISUALIZATION ---
-        
-        tab_am, tab_global = st.tabs(["👤 Vue par Account Manager", "🌍 Vue Globale Yassir"])
+        # TABS
+        tab_am, tab_global = st.tabs(["👤 Vue par AM", "🌍 Vue Globale"])
 
-        # ====================================================================
-        # ONGLET 1 : VUE PAR AM
-        # ====================================================================
+        # --- VUE AM ---
         with tab_am:
-            # Sélecteur AM
             am_list = ["Tous"] + sorted(df_filtered['AM_OWNER'].astype(str).unique().tolist())
-            selected_am = st.selectbox("Choisir un Account Manager :", am_list)
-            
-            if selected_am != "Tous":
-                df_view = df_filtered[df_filtered['AM_OWNER'] == selected_am]
-            else:
-                df_view = df_filtered
+            selected_am = st.selectbox("Account Manager :", am_list)
+            df_view = df_filtered[df_filtered['AM_OWNER'] == selected_am] if selected_am != "Tous" else df_filtered
 
-            # --- HEADER KPIs ---
-            col1, col2, col3, col4, col5 = st.columns(5)
-            
-            gmv = df_view['GMV'].sum()
-            orders = len(df_view)
-            cancel_rate = (df_view['is_cancelled'].sum() / orders * 100) if orders > 0 else 0
-            aov = gmv / orders if orders > 0 else 0
-            del_time = df_view['Delivery Time'].mean()
-
-            col1.metric("💰 Chiffre d'Affaires", f"{gmv:,.0f} DH")
-            col2.metric("📦 Commandes", f"{orders:,.0f}")
-            col3.metric("🛒 Panier Moyen (AOV)", f"{aov:.0f} DH")
-            col4.metric("❌ Taux d'Annulation", f"{cancel_rate:.2f}%")
-            col5.metric("⏱️ Temps Livraison", f"{del_time:.0f} min")
+            # KPIs Header
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("💰 Chiffre d'Affaires", f"{df_view['GMV'].sum():,.0f} DH")
+            c2.metric("📦 Commandes", f"{len(df_view):,.0f}")
+            c3.metric("🛒 Panier Moyen", f"{(df_view['GMV'].sum()/len(df_view) if len(df_view)>0 else 0):.0f} DH")
+            c4.metric("❌ Taux Annulation", f"{(df_view['is_cancelled'].mean()*100):.2f}%")
+            c5.metric("⏱️ Temps Livraison", f"{df_view['Delivery Time'].mean():.0f} min")
 
             st.divider()
 
-            # --- TABLEAU ÉVOLUTION PAR MOIS (AMÉLIORÉ) ---
-            st.subheader("📅 Tableau de Bord Mensuel (KPIs & Croissance)")
-            st.markdown("Vue détaillée mois par mois avec progression (Prog/Reg) par rapport au mois précédent.")
-            
-            with st.expander("Voir le tableau d'évolution complet", expanded=True):
-                df_evo_am = get_monthly_evolution_table(df_view)
-                
-                # Mise en forme conditionnelle pour les colonnes "Prog/Reg"
+            # Evolution Tabulaire
+            st.subheader("📅 Détail Mensuel & Progression")
+            with st.expander("Voir le tableau", expanded=True):
+                df_evo = get_monthly_evolution_table(df_view)
                 st.dataframe(
-                    df_evo_am.style
-                    .background_gradient(cmap="Purples", subset=['CA (GMV)', 'Commandes'])
-                    .format("{:.2f}%", subset=['Prog/Reg CA %', 'Prog/Reg Cmd %', 'Prog/Reg AOV %', 'Prog/Reg Annul %', 'Prog/Reg Temps %'], na_rep="-"),
+                    df_evo.style.background_gradient(cmap="Purples", subset=['CA (GMV)'])
+                    .format("{:+.2f}%", subset=['Prog/Reg CA %', 'Prog/Reg Cmd %', 'Prog/Reg AOV %', 'Prog/Reg Annul %', 'Prog/Reg Temps %'], na_rep="-"),
                     use_container_width=True
                 )
-
-            st.divider()
             
-            # --- GRAPHIQUES ---
-            st.subheader(f"📈 Tendances Graphiques - {selected_am}")
-            df_growth = df_view.groupby(df_view['order day'].dt.to_period('M').astype(str)).agg({
-                'GMV': 'sum', 'order id': 'count'
-            }).reset_index().rename(columns={'order day': 'Mois'})
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                fig_gmv = px.bar(df_growth, x='Mois', y='GMV', title="Évolution du GMV", color_discrete_sequence=['#6c35de'])
-                st.plotly_chart(fig_gmv, use_container_width=True)
-            with c2:
-                fig_orders = px.line(df_growth, x='Mois', y='order id', title="Évolution Volume Commandes", markers=True, color_discrete_sequence=['#ff00ff'])
-                st.plotly_chart(fig_orders, use_container_width=True)
-
             st.divider()
 
-            # --- TOP & FLOP 10 ---
+            # Graphs & Top 10
+            c_graph1, c_graph2 = st.columns(2)
+            growth_data = df_view.groupby(df_view['order day'].dt.to_period('M').astype(str)).agg({'GMV':'sum', 'order id':'count'}).reset_index()
+            c_graph1.plotly_chart(px.bar(growth_data, x='order day', y='GMV', title="Evolution GMV", color_discrete_sequence=['#6c35de']), use_container_width=True)
+            c_graph2.plotly_chart(px.line(growth_data, x='order day', y='order id', title="Evolution Commandes", markers=True, color_discrete_sequence=['#ff00ff']), use_container_width=True)
+            
+            # Top 10
             st.subheader("🏆 Classement Restaurants")
-            
             df_rank = df_view.groupby(['Restaurant_Final', 'City_Final']).agg({
                 'GMV': 'sum', 'order id': 'count', 'is_cancelled': 'mean', 'Delivery Time': 'mean'
             }).reset_index()
-            df_rank['Taux Annulation %'] = (df_rank['is_cancelled'] * 100).round(2)
-            df_rank['AOV'] = (df_rank['GMV'] / df_rank['order id']).round(0)
-            df_rank['GMV'] = df_rank['GMV'].round(0)
-            df_rank['Delivery Time'] = df_rank['Delivery Time'].round(1)
-
-            sort_col = st.selectbox("Classer par :", ["GMV", "Commandes", "Taux Annulation %", "AOV", "Temps Livraison"])
-            col_map = {"GMV": "GMV", "Commandes": "order id", "Taux Annulation %": "Taux Annulation %", "AOV": "AOV", "Temps Livraison": "Delivery Time"}
-            tech_col = col_map[sort_col]
-            ascending_top = True if tech_col in ["Taux Annulation %", "Delivery Time"] else False
-            cols_to_show = ['Restaurant_Final', 'City_Final', 'GMV', 'order id', 'Taux Annulation %', 'AOV', 'Delivery Time']
-
+            df_rank['Taux Annul %'] = (df_rank['is_cancelled']*100).round(2)
+            
+            sort_col = st.selectbox("Trier par :", ["GMV", "Commandes", "Taux Annul %", "Temps Livraison"])
+            tech_col = {'GMV':'GMV', 'Commandes':'order id', 'Taux Annul %':'Taux Annul %', 'Temps Livraison':'Delivery Time'}[sort_col]
+            asc = True if tech_col in ['Taux Annul %', 'Delivery Time'] else False
+            
             c_top, c_flop = st.columns(2)
-            with c_top:
-                st.markdown(f"#### 🌟 TOP 10 ({sort_col})")
-                st.dataframe(df_rank.sort_values(tech_col, ascending=ascending_top).head(10)[cols_to_show].style.background_gradient(cmap="Purples", subset=[tech_col]), use_container_width=True)
-            with c_flop:
-                st.markdown(f"#### ⚠️ FLOP 10 ({sort_col})")
-                st.dataframe(df_rank.sort_values(tech_col, ascending=not ascending_top).head(10)[cols_to_show].style.background_gradient(cmap="Reds", subset=[tech_col]), use_container_width=True)
+            c_top.dataframe(df_rank.sort_values(tech_col, ascending=asc).head(10).style.background_gradient(cmap="Purples", subset=[tech_col]), use_container_width=True)
+            c_flop.dataframe(df_rank.sort_values(tech_col, ascending=not asc).head(10).style.background_gradient(cmap="Reds", subset=[tech_col]), use_container_width=True)
+            
+            st.divider()
+            
+            # --- NOUVELLE SECTION BAS DE PAGE : KPIS AVANCÉS ---
+            display_advanced_kpis(df_view, title_prefix="(Vue AM)")
 
-            with st.expander("📋 Détails Restaurants (Filtrables)"):
-                sel = st.multiselect("Filtrer par Restaurant :", sorted(df_rank['Restaurant_Final'].unique()))
-                st.dataframe(df_rank[df_rank['Restaurant_Final'].isin(sel)] if sel else df_rank, use_container_width=True)
 
-        # ====================================================================
-        # ONGLET 2 : VUE GLOBALE
-        # ====================================================================
+        # --- VUE GLOBALE ---
         with tab_global:
             st.header("🌍 Performance Globale Yassir")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("GMV Total", f"{df_filtered['GMV'].sum():,.0f} DH")
+            k2.metric("Commandes", f"{len(df_filtered):,.0f}")
+            k3.metric("Taux Annul.", f"{(df_filtered['is_cancelled'].mean()*100):.2f}%")
+            k4.metric("Perte Sèche Totale", f"{df_filtered['Missed GMV'].sum():,.0f} DH")
+
+            st.subheader("📅 Evolution Mensuelle Globale")
+            df_evo_global = get_monthly_evolution_table(df_filtered)
+            st.dataframe(
+                df_evo_global.style.background_gradient(cmap="Purples", subset=['CA (GMV)'])
+                .format("{:+.2f}%", subset=['Prog/Reg CA %', 'Prog/Reg Cmd %', 'Prog/Reg AOV %', 'Prog/Reg Annul %', 'Prog/Reg Temps %'], na_rep="-"),
+                use_container_width=True
+            )
             
-            tot_gmv = df_filtered['GMV'].sum()
-            tot_ord = len(df_filtered)
-            tot_cancel = (df_filtered['is_cancelled'].sum() / tot_ord * 100) if tot_ord > 0 else 0
-            
-            k1, k2, k3 = st.columns(3)
-            k1.metric("GMV Total", f"{tot_gmv:,.0f} DH")
-            k2.metric("Volume Commandes", f"{tot_ord:,.0f}")
-            k3.metric("Taux Annulation Global", f"{tot_cancel:.2f}%")
+            st.subheader("📊 Performance par AM")
+            df_am = df_filtered.groupby('AM_OWNER').agg({'GMV':'sum', 'order id':'count', 'is_cancelled':'mean', 'Missed GMV':'sum'}).reset_index()
+            fig = px.scatter(df_am, x='order id', y='GMV', size='Missed GMV', color='AM_OWNER', title="Matrice AM (Taille bulle = Perte Sèche)")
+            st.plotly_chart(fig, use_container_width=True)
             
             st.divider()
 
-            # --- TABLEAU ÉVOLUTION GLOBAL (AMÉLIORÉ) ---
-            st.subheader("📅 Détail Évolution Mensuelle Global (KPIs & Croissance)")
-            with st.expander("Voir le tableau d'évolution complet", expanded=True):
-                df_evo_global = get_monthly_evolution_table(df_filtered)
-                st.dataframe(
-                    df_evo_global.style
-                    .background_gradient(cmap="Purples", subset=['CA (GMV)', 'Commandes'])
-                    .format("{:.2f}%", subset=['Prog/Reg CA %', 'Prog/Reg Cmd %', 'Prog/Reg AOV %', 'Prog/Reg Annul %', 'Prog/Reg Temps %'], na_rep="-"),
-                    use_container_width=True
-                )
-            
-            st.divider()
-            
-            st.subheader("📊 Comparatif des Account Managers")
-            df_am_perf = df_filtered.groupby('AM_OWNER').agg({
-                'GMV': 'sum', 'order id': 'count', 'is_cancelled': 'mean', 'Restaurant_Final': 'nunique'
-            }).reset_index()
-            df_am_perf['Taux Annulation %'] = (df_am_perf['is_cancelled'] * 100).round(2)
-            df_am_perf = df_am_perf.rename(columns={'Restaurant_Final': 'Portefeuille (Nb Restos)'})
-            
-            fig_perf = px.scatter(df_am_perf, x='Portefeuille (Nb Restos)', y='GMV', size='order id', color='AM_OWNER', hover_name='AM_OWNER', title="Performance AM : Portefeuille vs Chiffre d'Affaires")
-            st.plotly_chart(fig_perf, use_container_width=True)
-            st.dataframe(df_am_perf.sort_values('GMV', ascending=False).style.background_gradient(cmap="Purples", subset=['GMV']), use_container_width=True)
+            # --- NOUVELLE SECTION BAS DE PAGE : KPIS AVANCÉS ---
+            display_advanced_kpis(df_filtered, title_prefix="(Vue Globale)")
 
     else:
-        st.warning("⚠️ Veuillez uploader les deux fichiers pour voir l'analyse.")
-
+        st.warning("Veuillez uploader les fichiers.")
 else:
-    st.info("👈 En attente des fichiers dans la barre latérale...")
+    st.info("En attente des fichiers...")
 
-# --- FOOTER ---
 st.markdown('<div class="footer">Bounoir Saif eddine - Yassir Analytics Dashboard</div>', unsafe_allow_html=True)
